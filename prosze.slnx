@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="prosze/prosze.vcxproj" Id="fbdb88ba-df48-4b46-a0d5-63c5a10c089b" />
+</Solution>

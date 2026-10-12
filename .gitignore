@@ -1,0 +1,35 @@
+# Prosze mapping file (contains real secret values)
+.prosze-map
+
+# Build outputs
+x64/
+prosze/x64/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.log
+*.tlog/
+*.idb
+*.recipe
+*.lastbuildstate
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Graphify cache
+graphify-out/
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+.DS_Store
