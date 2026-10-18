@@ -92,10 +92,46 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def terminal_is_interactive() -> bool:
+    """Return whether the process has a terminal suitable for the CUI."""
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, OSError):
+        return False
+
+
+def _masked_vault_value(value: object) -> str:
+    """Describe a vault value without displaying any part of the value."""
+    return "<hidden>"
+
+
+def _vault_lines(v: _Vault) -> list[str]:
+    """Build a privacy-safe vault summary shared by both terminal UIs."""
+    lines = ["VAULT MAP (.prosze-map)", "-" * 30]
+    if not v.fwd:
+        lines.append("(No active redacting terms yet)")
+    else:
+        for key, value in sorted(v.fwd.items()):
+            lines.append(f"- {key}: {_masked_vault_value(value)}")
+    lines.extend(("", f"Total mappings: {len(v.fwd)}"))
+    ner_state = "Active" if not getattr(v, "_ner_attempted", False) or v.ner else "Regex only"
+    lines.append(f"GLiNER: {ner_state}")
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Hermes CUI Application
 # ---------------------------------------------------------------------------
 def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
+    if config is None:
+        config = HermesConfig.load()
+
+    if not terminal_is_interactive():
+        run_hermes_cli_chat(v, config)
+        return
+
     try:
         from prompt_toolkit import Application
         from prompt_toolkit.buffer import Buffer
@@ -112,9 +148,6 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
             "    Install dependencies with: pip install prompt_toolkit requests\n"
         )
         sys.exit(1)
-
-    if config is None:
-        config = HermesConfig.load()
 
     session = ContinuousChatSession(config, v)
 
@@ -139,6 +172,20 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
         f"{'─' * 76}\n\n"
     )
 
+    welcome_text = (
+        f"<b>  ____  ____   ___  ____  _____ _____</b>\n"
+        f" <b>|  _ \\|  _ \\ / _ \\/ ___||__  /| ____|</b>\n"
+        f" <b>| |_) | |_) | | | \\___ \\  / / |  _|</b>\n"
+        f" <b>|____/|____/  \\___/|____//____||_____|</b>\n\n"
+        f"<style fg='ansigreen'>[GLiNER {'Active' if not v._ner_attempted or v.ner else 'Regex only'}]</style>  "
+        f"<style fg='ansiblue'>[ZERO-LEAK SHIELD ACTIVE]</style>  "
+        f"<style fg='ansiyellow'>[VAULT: {len(v.fwd)} entities]</style>\n\n"
+        f"<b>HERMES CONSOLE</b>  {config.api_base}\n"
+        f"<b>Model:</b> {config.model}\n"
+        f"Type a prompt below, or use <b>/help</b>, <b>/models</b>, <b>/vault</b>, <b>/copy</b>, <b>/exit</b>.\n"
+        f"{'-' * 76}\n\n"
+    )
+
     # Chat history display area
     chat_display = TextArea(
         text="",
@@ -151,10 +198,10 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
 
     # User input area
     prompt_input = TextArea(
-        height=Dimension(min=3, max=6, preferred=3),
+        height=Dimension.exact(1),
         prompt="❯ ",
-        wrap_lines=True,
-        multiline=True,
+        wrap_lines=False,
+        multiline=False,
         style="class:prompt-input",
     )
 
@@ -164,23 +211,12 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
         read_only=True,
         scrollbar=True,
         wrap_lines=True,
-        width=Dimension(preferred=35),
+        width=Dimension(min=24, max=42, preferred=32),
         style="class:vault-panel",
     )
 
     def refresh_vault_display():
-        lines = ["<b>🔒 VAULT MAP (.prosze-map)</b>", "─" * 30]
-        if not v.fwd:
-            lines.append("<i>(No active redacting terms yet)</i>")
-        else:
-            for k, val in sorted(v.fwd.items()):
-                # Mask value preview slightly for safety in demo
-                display_val = val if len(val) <= 22 else val[:20] + "…"
-                lines.append(f"• <b>{k}</b>: {display_val}")
-        lines.append("")
-        lines.append(f"Total mappings: {len(v.fwd)}")
-        lines.append(f"GLiNER: {'Active' if not getattr(v, '_ner_attempted', False) or v.ner else 'Disabled'}")
-        vault_display.text = "\n".join(lines)
+        vault_display.text = "\n".join(_vault_lines(v))
 
     refresh_vault_display()
 
@@ -189,7 +225,7 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
         stream_indicator = "⚡ STREAMING..." if state["is_streaming"] else "● READY"
         return [
             ("class:status-badge", f" {stream_indicator} "),
-            ("class:status-info", f" │ Model: {config.model} │ Terms in Vault: {len(v.fwd)} │ {state['status_msg']} "),
+            ("class:status-info", f" | Model: {config.model} | Terms: {len(v.fwd)} | {state['status_msg']} "),
         ]
 
     status_bar = Window(
@@ -200,6 +236,11 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
 
     # Dynamic Header Banner
     def get_header_text():
+        return [
+            ("class:header-title", "  o  o  o  "),
+            ("class:header-sub", "> prosze-shield : session_01 (zsh)  "),
+            ("class:header-meta", f"[SHIELD ACTIVE]  [{config.provider.upper()}]  {config.model} "),
+        ]
         return [
             ("class:header-title", " HERMES "),
             ("class:header-sub", "× PROSZE PRIVACY SHIELD  "),
@@ -346,12 +387,37 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
             elif cmd == "/copy":
                 _handle_copy_last(None)
                 return
+            elif cmd == "/redact":
+                if not arg:
+                    chat_display.text += "\n<style fg='ansiyellow'>Usage: /redact &lt;text&gt;</style>\n\n"
+                else:
+                    safe_text, hidden_count = v.redact(arg)
+                    chat_display.text += (
+                        f"\n<style fg='ansiyellow'>[LOCAL REDACTION] {hidden_count} item(s) hidden</style>\n"
+                        f"{safe_text}\n\n"
+                    )
+                    refresh_vault_display()
+                    state["status_msg"] = "Prompt redacted locally."
+                app.invalidate()
+                return
             else:
                 chat_display.text += f"\n<i>[Error] Unknown command: {cmd}. Type /help for options.</i>\n\n"
                 app.invalidate()
                 return
 
         # 2. Regular Prompt Streaming
+        if not config.api_key:
+            safe_text, hidden_count = v.redact(user_msg)
+            chat_display.text += (
+                "\n<style fg='ansiyellow'>[OFFLINE MODE] No API key configured; nothing was sent.</style>\n"
+                f"<style fg='ansigreen'>[LOCAL REDACTION] {hidden_count} item(s) hidden</style>\n"
+                f"{safe_text}\n\n"
+            )
+            state["last_ai_reply"] = safe_text
+            state["status_msg"] = "Offline mode: prompt redacted locally."
+            refresh_vault_display()
+            app.invalidate()
+            return
         state["is_streaming"] = True
         state["status_msg"] = "Redacting prompt and streaming response..."
 
@@ -389,12 +455,15 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
                         app.invalidate()
                     elif etype == "info":
                         chat_display.text += f"\n<i>[Notice] {event.get('message', '')}</i>\n"
+                        state["status_msg"] = "Notice received."
                         app.invalidate()
                     elif etype == "error":
                         chat_display.text += f"\n<style fg='ansired'><b>[Error]</b> {event.get('message', '')}</style>\n"
+                        state["status_msg"] = "Request failed. See the conversation for details."
                         app.invalidate()
                     elif etype == "cancelled":
                         chat_display.text += "\n<style fg='ansiyellow'><i>[Stream interrupted]</i></style>\n"
+                        state["status_msg"] = "Generation stopped by user."
                         app.invalidate()
                     elif etype == "done":
                         state["last_ai_reply"] = "".join(ai_reply_chunks)
@@ -403,6 +472,7 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
                         app.invalidate()
             except Exception as exc:
                 chat_display.text += f"\n<style fg='ansired'>[Exception] {exc}</style>\n\n"
+                state["status_msg"] = "Unexpected error. See the conversation for details."
             finally:
                 state["is_streaming"] = False
                 app.invalidate()
@@ -413,14 +483,14 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
     def build_root():
         chat_col = HSplit([
             chat_display,
-            Window(height=1, content=FormattedTextControl([("class:sep", "─" * 120)])),
+            Window(height=1, char="─", style="class:sep"),
             prompt_input,
         ])
 
         if state["show_vault_panel"]:
             main_split = VSplit([
                 chat_col,
-                Window(width=1, content=FormattedTextControl([("class:sep", "│" * 50)])),
+                Window(width=1, char="│", style="class:sep"),
                 vault_display,
             ])
         else:
@@ -428,7 +498,7 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
 
         return HSplit([
             header_bar,
-            Window(height=1, content=FormattedTextControl([("class:sep", "─" * 120)])),
+            Window(height=1, char="─", style="class:sep"),
             main_split,
             status_bar,
         ])
@@ -450,7 +520,7 @@ def run_hermes_tui(v: _Vault, config: Optional[HermesConfig] = None) -> None:
 
     try:
         app = Application(
-            layout=Layout(build_root()),
+            layout=Layout(build_root(), focused_element=prompt_input),
             key_bindings=kb,
             style=hermes_style,
             full_screen=True,
@@ -475,9 +545,32 @@ def run_hermes_cli_chat(v: _Vault, config: HermesConfig, session: Optional[Conti
         f"│  Model: {config.model:<24} │  Endpoint: {config.provider.title():<20}   │\n"
         f"│  Privacy Shield: ACTIVE            │  Vault Terms: {len(v.fwd):<20} │\n"
         "└──────────────────────────────────────────────────────────────────────────┘\n"
-        "Commands: /help, /models, /model <name>, /vault, /clear, /exit\n"
+        "Commands: /help, /models, /model <name>, /vault, /system <text>, /copy, /clear, /exit\n"
         "──────────────────────────────────────────────────────────────────────────\n"
     )
+    banner = (
+        "\n"
+        "+------------------------------------------------------------------------------+\n"
+        "|  o  o  o       > prosze-shield : session_01              [* SHIELD ACTIVE]  |\n"
+        "+------------------------------------------------------------------------------+\n"
+        "│  ____  ____   ___  ____  _____ _____        [GLiNER] [ZERO-LEAK] [VAULT: "
+        f"{len(v.fwd)}] │\n"
+        "| |  _ \\|  _ \\ / _ \\/ ___||__  /| ____|        "
+        f"[MODEL: {config.model[:24]:<24}] │\n"
+        "│ | |_) | |_) | | | \\___ \\  / / |  _|          "
+        f"[UPSTREAM: {config.provider.title():<17}] |\n"
+        "| |____/|____/  \\___/|____//____||_____|                                      |\n"
+        "|                                                                              |\n"
+        "|  Privacy shield is active. Prompts are sanitized locally before sending.    |\n"
+        "|  Type a prompt below, or use /help, /models, /vault, /copy, /exit.          |\n"
+        "+------------------------------------------------------------------------------+\n"
+        "|  MODE: ZERO-LEAK INTERACTIVE        [Enter] Send   [Ctrl+C] Cancel           |\n"
+        "+------------------------------------------------------------------------------+\n"
+    )
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
     print(banner, flush=True)
 
     while True:
@@ -510,17 +603,20 @@ def run_hermes_cli_chat(v: _Vault, config: HermesConfig, session: Optional[Conti
                     "  /vault         - Display active .prosze-map mappings\n"
                     "  /clear         - Reset conversation context\n"
                     "  /system <text> - Set custom system prompt\n"
+                    "  /copy          - Copy the last AI response to clipboard\n"
                     "  /exit          - Quit console\n",
                     flush=True
                 )
                 continue
             elif cmd == "/vault":
-                print("\n🔒 VAULT MAP (.prosze-map):")
-                if not v.fwd:
-                    print("  (No active mappings yet)")
+                print("\n" + "\n".join(f"  {line}" for line in _vault_lines(v)))
+                continue
+            elif cmd == "/redact":
+                if not arg:
+                    print("Usage: /redact <text>", flush=True)
                 else:
-                    for k, val in sorted(v.fwd.items()):
-                        print(f"  • {k} -> {val}")
+                    safe_text, hidden_count = v.redact(arg)
+                    print(f"\n[LOCAL REDACTION] {hidden_count} item(s) hidden:\n{safe_text}\n", flush=True)
                 continue
             elif cmd == "/model":
                 if arg:
@@ -542,7 +638,34 @@ def run_hermes_cli_chat(v: _Vault, config: HermesConfig, session: Optional[Conti
                     print(f"Model query notice: {msg}")
                 continue
 
+            elif cmd == "/system":
+                if arg:
+                    config.system_prompt = arg
+                    print("System prompt updated.", flush=True)
+                else:
+                    print("Current system prompt is configured.", flush=True)
+                continue
+            elif cmd == "/copy":
+                turns = getattr(session, "turns", [])
+                reply = turns[-1].raw_content if turns else ""
+                if reply and copy_to_clipboard(reply):
+                    print("Copied last reply to clipboard.", flush=True)
+                else:
+                    print("No reply copied (clipboard unavailable or no reply).", flush=True)
+                continue
+            else:
+                print(f"Unknown command: {cmd}. Type /help for options.", flush=True)
+                continue
+
         # Normal prompt: stream via session
+        if not config.api_key:
+            safe_text, hidden_count = v.redact(prompt)
+            print(
+                "\n[OFFLINE MODE] No API key configured; nothing was sent."
+                f"\n[LOCAL REDACTION] {hidden_count} item(s) hidden:\n{safe_text}\n",
+                flush=True,
+            )
+            continue
         print(f"\n◆ Hermes ({config.model}):", flush=True)
         try:
             for event in session.stream_chat(prompt):

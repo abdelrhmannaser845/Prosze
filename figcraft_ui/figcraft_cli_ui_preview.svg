@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 800" width="1080" height="800">
+  <defs>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="115%" filterUnits="userSpaceOnUse">
+      <feGaussianBlur stdDeviation="16" in="SourceAlpha" />
+      <feOffset dx="0" dy="12" />
+      <feComponentTransfer><feFuncA type="linear" slope="0.55"/></feComponentTransfer>
+      <feMerge>
+        <feMergeNode />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    <linearGradient id="headerGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c2128" />
+      <stop offset="100%" stop-color="#161b22" />
+    </linearGradient>
+    <linearGradient id="bannerGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#161b22" />
+      <stop offset="100%" stop-color="#1a2332" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background Canvas -->
+  <rect width="100%" height="100%" fill="#06090e" />
+
+  <!-- Main Window Frame -->
+  <g transform="translate(40, 40)" filter="url(#shadow)">
+    <!-- Window Body Background -->
+    <rect width="1000" height="720" rx="14" fill="#0d1117" stroke="#30363d" stroke-width="1.5" />
+
+    <!-- Header Bar -->
+    <path d="M 0,14 Q 0,0 14,0 L 986,0 Q 1000,0 1000,14 L 1000,44 L 0,44 Z" fill="url(#headerGrad)" stroke="#30363d" stroke-width="1" />
+    <line x1="0" y1="44" x2="1000" y2="44" stroke="#30363d" stroke-width="1" />
+
+    <!-- Window Traffic Lights -->
+    <g transform="translate(18, 16)">
+      <circle cx="6" cy="6" r="6" fill="#ff5f56" stroke="#e0443e" stroke-width="0.5" />
+      <circle cx="26" cy="6" r="6" fill="#ffbd2e" stroke="#dea123" stroke-width="0.5" />
+      <circle cx="46" cy="6" r="6" fill="#27c93f" stroke="#1aab29" stroke-width="0.5" />
+    </g>
+
+    <!-- Header Tab / Title -->
+    <g transform="translate(320, 7)">
+      <rect width="360" height="30" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1" />
+      <text x="180" y="20" fill="#c9d1d9" font-family="Fira Code, SF Mono, Menlo, monospace" font-size="12" font-weight="500" text-anchor="middle">
+        ❯ prosze-shield : session_01 (zsh)
+      </text>
+    </g>
+
+    <!-- Header Live Status Pill -->
+    <g transform="translate(860, 9)">
+      <rect width="122" height="26" rx="13" fill="#1f242c" stroke="#388bfd55" stroke-width="1" />
+      <circle cx="16" cy="13" r="4.5" fill="#3fb950">
+        <animate attributeName="opacity" values="1;0.4;1" dur="2s" repeatCount="indefinite" />
+      </circle>
+      <text x="28" y="17" fill="#58a6ff" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="10.5" font-weight="700" letter-spacing="0.5">SHIELD ACTIVE</text>
+    </g>
+
+    <!-- Terminal Canvas Interior -->
+    <g transform="translate(24, 60)">
+      <!-- ASCII Logo / Banner Card -->
+      <g>
+        <rect width="952" height="114" rx="8" fill="url(#bannerGrad)" stroke="#21262d" stroke-width="1" />
+        <text x="20" y="24" fill="#58a6ff" font-family="Fira Code, SF Mono, Menlo, monospace" font-size="11" line-height="1.3" xml:space="preserve">
+  ____  ____   ___  ____  _____ _____
+ |  _ \|  _ \ / _ \/ ___||__  /| ____|
+ | |_) | |_) | | | \___ \  / / |  _|  
+ |  __/|  _ &lt;| |_| |___) |/ /_ | |___ 
+ |_|   |_| \_\\___/|____//____||_____|  v1.4.2 [Zero-Leak Local Privacy Shield]
+        </text>
+
+        <!-- Status Badges inside Banner -->
+        <g transform="translate(20, 80)">
+          <!-- Badge 1 -->
+          <g>
+            <rect width="180" height="22" rx="4" fill="#0d1117" stroke="#238636" stroke-width="1" />
+            <text x="90" y="15" fill="#3fb950" font-family="monospace" font-size="10.5" text-anchor="middle">NER Engine: GLiNER (Active)</text>
+          </g>
+          <!-- Badge 2 -->
+          <g transform="translate(190, 0)">
+            <rect width="160" height="22" rx="4" fill="#0d1117" stroke="#1f6feb" stroke-width="1" />
+            <text x="80" y="15" fill="#79c0ff" font-family="monospace" font-size="10.5" text-anchor="middle">Proxy: 127.0.0.1:8080</text>
+          </g>
+          <!-- Badge 3 -->
+          <g transform="translate(360, 0)">
+            <rect width="185" height="22" rx="4" fill="#0d1117" stroke="#9e6a03" stroke-width="1" />
+            <text x="92" y="15" fill="#d29922" font-family="monospace" font-size="10.5" text-anchor="middle">Vault: 14 Entities Shielded</text>
+          </g>
+          <!-- Badge 4 -->
+          <g transform="translate(555, 0)">
+            <rect width="180" height="22" rx="4" fill="#0d1117" stroke="#8957e5" stroke-width="1" />
+            <text x="90" y="15" fill="#bc8cff" font-family="monospace" font-size="10.5" text-anchor="middle">AES-GCM Memory Shield</text>
+          </g>
+        </g>
+      </g>
+
+      <!-- Terminal Command 1 -->
+      <g transform="translate(0, 134)">
+        <text x="0" y="18" fill="#3fb950" font-family="Fira Code, monospace" font-size="13" font-weight="700">user@host ❯</text>
+        <text x="110" y="18" fill="#f0f6fc" font-family="Fira Code, monospace" font-size="13">prosze redact --in customer_report.txt --stream --ai claude-3-5-sonnet</text>
+      </g>
+
+      <!-- Redaction Activity Card -->
+      <g transform="translate(0, 168)">
+        <rect width="952" height="110" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1" />
+        <text x="16" y="24" fill="#f0883e" font-family="Fira Code, monospace" font-size="11.5" font-weight="700">
+          🔒 SHIELD INTERCEPTED &amp; REDACTED 3 HIGH-RISK TOKENS (PRE-FLIGHT):
+        </text>
+
+        <!-- Redacted Items -->
+        <g transform="translate(16, 38)">
+          <text x="0" y="14" fill="#58a6ff" font-family="Fira Code, monospace" font-size="12">[[NAME_PERSON_1]]</text>
+          <text x="210" y="14" fill="#8b949e" font-family="monospace" font-size="12">Full Name ('Sarah Jenkins')</text>
+          <text x="560" y="14" fill="#7ee787" font-family="monospace" font-size="11">Confidence: 99.4% [GLiNER]</text>
+
+          <text x="0" y="34" fill="#58a6ff" font-family="Fira Code, monospace" font-size="12">[[KEY_STRIPE_SECRET_1]]</text>
+          <text x="210" y="34" fill="#8b949e" font-family="monospace" font-size="12">API Key ('sk_live_51M...38x')</text>
+          <text x="560" y="34" fill="#7ee787" font-family="monospace" font-size="11">Entropy: 4.88 bit/sym [High Risk]</text>
+
+          <text x="0" y="54" fill="#58a6ff" font-family="Fira Code, monospace" font-size="12">[[IBAN_DE_1]]</text>
+          <text x="210" y="54" fill="#8b949e" font-family="monospace" font-size="12">Bank Account ('DE89370400440532013000')</text>
+          <text x="560" y="54" fill="#7ee787" font-family="monospace" font-size="11">MOD-97 Validated</text>
+        </g>
+      </g>
+
+      <!-- AI Response Card -->
+      <g transform="translate(0, 292)">
+        <rect width="952" height="110" rx="8" fill="#090d13" stroke="#1f6feb44" stroke-width="1" />
+        <g transform="translate(16, 20)">
+          <text x="0" y="0" fill="#bc8cff" font-family="Fira Code, monospace" font-size="11.5" font-weight="700">
+            ✦ AI ASSISTANT (RESTORED ON THE FLY VIA LOCAL VAULT):
+          </text>
+          <text x="0" y="24" fill="#c9d1d9" font-family="Fira Code, SF Mono, Menlo, monospace" font-size="12" line-height="1.5">
+            Analysis complete for Sarah Jenkins. The subscription billing on account DE89370400440532013000
+          </text>
+          <text x="0" y="44" fill="#c9d1d9" font-family="Fira Code, SF Mono, Menlo, monospace" font-size="12" line-height="1.5">
+            was reconciled against Stripe key sk_live_51M...38x. All transactions match ledger criteria.
+          </text>
+          <text x="0" y="64" fill="#7ee787" font-family="Fira Code, SF Mono, Menlo, monospace" font-size="12" line-height="1.5">
+            ✓ Total verified: $14,250.00 USD across 3 recurring customer invoices.
+          </text>
+        </g>
+      </g>
+
+      <!-- Bottom Interactive Input Deck -->
+      <g transform="translate(0, 524)">
+        <!-- Input Box -->
+        <rect width="952" height="42" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1.5" />
+        <text x="16" y="26" fill="#58a6ff" font-family="monospace" font-size="15" font-weight="bold">❯</text>
+        <text x="36" y="26" fill="#8b949e" font-family="Fira Code, monospace" font-size="12.5">
+          Type prompt or /help, /models, /vault, /exit...
+        </text>
+        <rect x="410" y="12" width="8" height="18" fill="#58a6ff">
+          <animate attributeName="opacity" values="1;0;1" dur="1s" repeatCount="indefinite" />
+        </rect>
+
+        <!-- Footer Status Bar -->
+        <g transform="translate(0, 50)">
+          <rect width="952" height="26" rx="4" fill="#090d13" stroke="#30363d" stroke-width="1" />
+          <!-- Left Indicators -->
+          <text x="12" y="17" fill="#3fb950" font-family="monospace" font-size="10.5" font-weight="700">MODE: ZERO-LEAK INTERACTIVE</text>
+          <text x="220" y="17" fill="#58a6ff" font-family="monospace" font-size="10.5" font-weight="700">UPSTREAM: api.anthropic.com</text>
+          <text x="440" y="17" fill="#79c0ff" font-family="monospace" font-size="10.5" font-weight="700">LATENCY: 142ms</text>
+
+          <!-- Right Key Hints -->
+          <text x="630" y="17" fill="#8b949e" font-family="monospace" font-size="10.5">[Enter] Send</text>
+          <text x="720" y="17" fill="#8b949e" font-family="monospace" font-size="10.5">[Esc] Cancel</text>
+          <text x="810" y="17" fill="#8b949e" font-family="monospace" font-size="10.5">[/help] Commands</text>
+          <text x="900" y="17" fill="#8b949e" font-family="monospace" font-size="10.5">[^C] Exit</text>
+        </g>
+      </g>
+    </g>
+  </g>
+</svg>

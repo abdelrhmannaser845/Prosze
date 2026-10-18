@@ -132,7 +132,14 @@ def cmd_proxy(v: Vault, listen: str, upstream: str, verbose: bool) -> None:
     host, _, port = listen.rpartition(":")
     if host not in ("127.0.0.1", "localhost", "::1"):
         sys.stderr.write("[prosze] WARNING: non-loopback address exposes your secret map to the network.\n")
-    srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), make_handler(v, upstream, verbose))
+    try:
+        listen_port = int(port)
+        if not 1 <= listen_port <= 65535:
+            raise ValueError
+        handler = make_handler(v, upstream, verbose)
+        srv = ThreadingHTTPServer((host or "127.0.0.1", listen_port), handler)
+    except (OSError, ValueError) as exc:
+        sys.exit(f"prosze: invalid proxy address or upstream: {exc}")
     sys.stderr.write(f"[prosze] {listen} -> {upstream}   (map: {v.map_path})\n")
     try:
         srv.serve_forever()
@@ -142,12 +149,16 @@ def cmd_proxy(v: Vault, listen: str, upstream: str, verbose: bool) -> None:
 
 # ---- CLI ----------------------------------------------------------------
 def cli_main(argv: Optional[list[str]] = None) -> None:
-    argv = argv or sys.argv[1:]
+    if argv is None:
+        argv = sys.argv[1:]
     if "--" in argv:
         i = argv.index("--")
         cli_args, cmd = argv[:i], argv[i + 1:]
     else:
         cli_args, cmd = argv, []
+
+    if not cli_args:
+        cli_args = ["tui"]
 
     common = build_common_parser()
     ap = argparse.ArgumentParser(

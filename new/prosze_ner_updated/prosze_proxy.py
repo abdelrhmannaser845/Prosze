@@ -29,7 +29,7 @@ Options (all commands)
 
 The mapping file holds the real values in clear text: keep it local, out of git.
 """
-import argparse, codecs, copy, http.client, json, os, re, shutil, subprocess, sys, threading
+import argparse, codecs, copy, http.client, json, os, re, shutil, socket, subprocess, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -317,7 +317,7 @@ def walk(o, fn):
 
 
 # ------------------------------------------------------- streaming un-redaction
-TAIL = re.compile(r"(\[\[[A-Z0-9_]*\]?|\[)$")   # possible start of a placeholder
+TAIL = re.compile(r"(?:\[\[[A-Z0-9_]*|\[\[[A-Z0-9_]*\])$|\[$")
 EVENT_SPLIT = re.compile(r"\r?\n\r?\n")
 
 class StreamRestorer:
@@ -338,8 +338,10 @@ class StreamRestorer:
         return [(k, self.held.pop(k)) for k in [k for k in self.held if pred(k)]]
 
     @staticmethod
-    def _render(name, data):
-        head = f"event: {name}\n" if name else ""
+    def _render(name, data, metadata=()):
+        head = "".join(f"{line}\n" for line in metadata)
+        if name:
+            head += f"event: {name}\n"
         return f"{head}data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     def feed_bytes(self, raw):
@@ -349,18 +351,38 @@ class StreamRestorer:
         return "".join(self._event(p) for p in parts).encode()
 
     def finish(self):
+        self.buf += self.dec.decode(b"", final=True)
         out = self._event(self.buf) if self.buf.strip() else ""
         self.buf = ""
+        for key, text in list(self.held.items()):
+            self.held.pop(key, None)
+            if key[0] == "a":
+                kind = key[2]
+                field = "text" if kind == "text" else "partial_json"
+                delta = {"type": "text_delta" if kind == "text" else "input_json_delta",
+                         field: self.v.restore(text, json_escaped=kind == "json")}
+                out += self._render("content_block_delta",
+                                    {"type": "content_block_delta", "index": key[1],
+                                     "delta": delta})
+            elif key[0] == "o":
+                delta = {"content": self.v.restore(text)} if key[2] == "c" else {
+                    "tool_calls": [{"index": key[3], "function": {
+                        "arguments": self.v.restore(text, json_escaped=True)}}]}
+                out += self._render(None, {"choices": [{"index": key[1],
+                                                         "finish_reason": None,
+                                                         "delta": delta}]})
         return out.encode()
 
     def _event(self, raw):
-        name, data_lines = None, []
+        name, data_lines, metadata = None, [], []
         for line in raw.split("\n"):
             line = line.rstrip("\r")
             if line.startswith("event:"):
                 name = line[6:].strip()
             elif line.startswith("data:"):
                 data_lines.append(line[5:].lstrip())
+            elif line:
+                metadata.append(line)
         payload = "\n".join(data_lines)
         try:
             d = json.loads(payload)
@@ -397,17 +419,24 @@ class StreamRestorer:
                                            "delta": {"content": self.v.restore(text)} if k[2] == "c" else
                                            {"tool_calls": [{"index": k[3], "function": {"arguments": self.v.restore(text, True)}}]}}]
                         extra += self._render(name, syn)
-        return extra + self._render(name, d)
+        return extra + self._render(name, d, metadata)
 
 
 # ----------------------------------------------------------------------- proxy
 HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding",
        "accept-encoding", "proxy-connection", "te", "upgrade"}
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+UPSTREAM_TIMEOUT = 60
 
 def make_handler(vault, upstream, verbose):
     u = urlsplit(upstream)
+    if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password:
+        raise ValueError("upstream must be an http(s) URL without credentials")
     https = u.scheme == "https"
-    port = u.port or (443 if https else 80)
+    try:
+        port = u.port or (443 if https else 80)
+    except ValueError as exc:
+        raise ValueError("upstream has an invalid port") from exc
     prefix = u.path.rstrip("/")
 
     class Handler(BaseHTTPRequestHandler):
@@ -417,28 +446,64 @@ def make_handler(vault, upstream, verbose):
             pass
 
         def _read_body(self):
-            if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-                body = b""
+            transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
+            content_lengths = self.headers.get_all("Content-Length", [])
+            if transfer_encoding and content_lengths:
+                raise ValueError("request must not contain both transfer-encoding and content-length")
+            if transfer_encoding:
+                if transfer_encoding.strip() != "chunked":
+                    raise ValueError("unsupported transfer-encoding")
+                body = bytearray()
                 while True:
-                    size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+                    line = self.rfile.readline(8193)
+                    if not line or len(line) > 8192 or not line.endswith(b"\n"):
+                        raise ValueError("malformed chunk size")
+                    try:
+                        size = int(line.split(b";", 1)[0].strip(), 16)
+                    except ValueError as exc:
+                        raise ValueError("malformed chunk size") from exc
+                    if size < 0 or len(body) + size > MAX_REQUEST_BYTES:
+                        raise ValueError("request body is too large")
                     if size == 0:
-                        self.rfile.readline()
-                        return body
-                    body += self.rfile.read(size)
-                    self.rfile.readline()
-            n = int(self.headers.get("Content-Length") or 0)
-            return self.rfile.read(n) if n else b""
+                        while True:
+                            trailer = self.rfile.readline(8193)
+                            if not trailer or len(trailer) > 8192 or not trailer.endswith(b"\n"):
+                                raise ValueError("malformed chunk trailer")
+                            if trailer in (b"\n", b"\r\n"):
+                                return bytes(body)
+                    chunk = self.rfile.read(size)
+                    if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                        raise ValueError("malformed chunk data")
+                    body.extend(chunk)
+            if len(content_lengths) > 1 or (content_lengths and content_lengths[0].strip() == ""):
+                raise ValueError("malformed content-length")
+            try:
+                n = int(content_lengths[0]) if content_lengths else 0
+            except ValueError as exc:
+                raise ValueError("malformed content-length") from exc
+            if n < 0 or n > MAX_REQUEST_BYTES:
+                raise ValueError("request body is too large")
+            body = self.rfile.read(n) if n else b""
+            if len(body) != n:
+                raise ValueError("incomplete request body")
+            return body
 
         def _fail(self, code, msg):
-            data = json.dumps({"error": {"type": "prosze_error", "message": msg}}).encode()
+            data = json.dumps({"error": {"type": "prosze_error", "message": msg}},
+                              ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(data)
+            self.close_connection = True
 
         def _handle(self):
-            body = self._read_body()
+            try:
+                body = self._read_body()
+            except (ValueError, OSError) as exc:
+                return self._fail(400, str(exc))
             hits = 0
             if body:
                 try:
@@ -457,59 +522,74 @@ def make_handler(vault, upstream, verbose):
                 sys.stderr.write("[prosze] outbound (redacted): " + body[:2000].decode("utf-8", "replace") + "\n")
             sys.stderr.write(f"[prosze] {self.command} {self.path}: {hits} secret(s) hidden\n")
 
-            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+            connection_headers = {h.strip().lower() for h in self.headers.get("Connection", "").split(",")}
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in HOP and k.lower() not in connection_headers}
             headers["Host"] = u.netloc
             headers["Content-Length"] = str(len(body))
+            conn = None
             try:
                 cls = http.client.HTTPSConnection if https else http.client.HTTPConnection
-                conn = cls(u.hostname, port, timeout=600)
-                conn.request(self.command, prefix + self.path, body=body, headers=headers)
+                conn = cls(u.hostname, port, timeout=UPSTREAM_TIMEOUT)
+                request_path = urlsplit(self.path).path or "/"
+                request_query = urlsplit(self.path).query
+                target = (prefix + "/" + request_path.lstrip("/")) if prefix else "/" + request_path.lstrip("/")
+                if request_query:
+                    target += "?" + request_query
+                conn.request(self.command, target, body=body, headers=headers)
                 resp = conn.getresponse()
-            except Exception as e:
-                return self._fail(502, f"upstream error: {e}")
+            except (OSError, http.client.HTTPException, ValueError):
+                if conn:
+                    conn.close()
+                return self._fail(502, "upstream unavailable")
 
             out_headers = [(k, v) for k, v in resp.getheaders() if k.lower() not in HOP | {"content-encoding"}]
             encoded = resp.getheader("Content-Encoding", "identity").lower() != "identity"
             ctype = (resp.getheader("Content-Type") or "").lower()
 
-            if encoded:                                  # cannot restore: pass through as-is
-                data = resp.read()
-                self.send_response(resp.status)
-                for k, v in resp.getheaders():
-                    if k.lower() not in HOP:
+            try:
+                if encoded:                                  # cannot restore: pass through as-is
+                    data = resp.read()
+                    self.send_response(resp.status)
+                    for k, v in out_headers:
                         self.send_header(k, v)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            elif "text/event-stream" in ctype:
-                self.send_response(resp.status)
-                for k, v in out_headers:
-                    self.send_header(k, v)
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
-                sr = StreamRestorer(vault)
-                def chunk(b):
-                    if b:
-                        self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
-                        self.wfile.flush()
-                while True:
-                    raw = resp.read1(65536)
-                    if not raw:
-                        break
-                    chunk(sr.feed_bytes(raw))
-                chunk(sr.finish())
-                self.wfile.write(b"0\r\n\r\n")
-            else:
-                data = resp.read()
-                if "json" in ctype or ctype.startswith("text/"):
-                    data = vault.restore(data.decode("utf-8", "replace"), json_escaped="json" in ctype).encode()
-                self.send_response(resp.status)
-                for k, v in out_headers:
-                    self.send_header(k, v)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            conn.close()
+                    self.send_header("Content-Encoding", resp.getheader("Content-Encoding"))
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                elif "text/event-stream" in ctype:
+                    self.send_response(resp.status)
+                    for k, v in out_headers:
+                        self.send_header(k, v)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    sr = StreamRestorer(vault)
+                    def chunk(data):
+                        if data:
+                            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                            self.wfile.flush()
+                    while True:
+                        raw = resp.read1(65536)
+                        if not raw:
+                            break
+                        chunk(sr.feed_bytes(raw))
+                    chunk(sr.finish())
+                    self.wfile.write(b"0\r\n\r\n")
+                else:
+                    data = resp.read()
+                    if "json" in ctype or ctype.startswith("text/"):
+                        data = vault.restore(data.decode("utf-8", "replace"),
+                                             json_escaped="json" in ctype).encode()
+                    self.send_response(resp.status)
+                    for k, v in out_headers:
+                        self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+            except (OSError, http.client.HTTPException, socket.timeout):
+                self.close_connection = True
+            finally:
+                conn.close()
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
 
@@ -619,7 +699,14 @@ def main():
         host, _, port = a.listen.rpartition(":")
         if host not in ("127.0.0.1", "localhost", "::1"):
             sys.stderr.write("[prosze] WARNING: non-loopback address exposes your secret map to the network.\n")
-        srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), make_handler(v, a.upstream, a.verbose))
+        try:
+            listen_port = int(port)
+            if not 1 <= listen_port <= 65535:
+                raise ValueError
+            handler = make_handler(v, a.upstream, a.verbose)
+            srv = ThreadingHTTPServer((host or "127.0.0.1", listen_port), handler)
+        except ValueError as exc:
+            sys.exit(f"prosze: invalid proxy address or upstream: {exc}")
         sys.stderr.write(f"[prosze] {a.listen} -> {a.upstream}   (map: {a.map})\n")
         try:
             srv.serve_forever()

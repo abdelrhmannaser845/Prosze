@@ -61,11 +61,16 @@ pip install -e .
 pip install -r requirements-ner.txt
 ```
 
+After installation, running `prosze` with no subcommand launches the interactive CUI. If an older installed command still prints help, rerun `pip install -e .` from `new/prosze_ner_updated` to refresh the console entry point.
+
 ## Usage
 
 ### Commands
 
 ```bash
+# Launch the interactive terminal app
+prosze
+
 # Interactive chat mode — paste a prompt, get the safe version, paste the reply, get real text back
 prosze chat
 
@@ -136,6 +141,21 @@ prosze proxy --listen 127.0.0.1:8787 --upstream https://api.anthropic.com
 # Then point your AI client to http://127.0.0.1:8787 instead of the real API
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 ```
+
+## Recent Enhancements
+
+- The terminal CUI now handles non-interactive terminals gracefully, keeps vault values hidden, provides clearer status and error messages, and documents `/copy` consistently.
+- The local proxy validates upstream URLs and listen addresses, rejects ambiguous or oversized request bodies, closes connections after malformed framing, filters hop-by-hop headers, preserves upstream path prefixes, and handles SSE placeholder boundaries safely.
+- The packaged `prosze proxy` command reports invalid proxy addresses without a traceback.
+- Deterministic Python tests cover vault persistence, JSON redaction, OpenAI-style SSE restoration, proxy round trips, malformed framing, path handling, CUI fallback behavior, and vault privacy.
+
+Run the complete Python test suite from the repository root:
+
+```powershell
+python -m unittest discover -s new/prosze_ner_updated/tests -v
+```
+
+The suite runs locally without downloading GLiNER or contacting external services. See [project_updates.md](project_updates.md) for the implementation and review history.
 
 ## Security Notes
 
