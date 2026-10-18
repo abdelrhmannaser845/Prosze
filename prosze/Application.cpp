@@ -43,6 +43,7 @@
   #ifndef NOMINMAX
   #define NOMINMAX
   #endif
+  #include <winsock2.h>
   #include <windows.h>
   #include <io.h>
   #include <fcntl.h>
@@ -50,7 +51,9 @@
   #define pclose _pclose
   #define isatty _isatty
 #else
+  #include <fcntl.h>
   #include <sys/stat.h>
+  #include <sys/wait.h>
   #include <unistd.h>
 #endif
 #include <algorithm>
@@ -67,6 +70,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "ProxyServer.h"
 
 using namespace std;
 
@@ -934,19 +938,6 @@ static string slurp_stdin()
     return string((istreambuf_iterator<char>(cin)), istreambuf_iterator<char>());
 }
 
-static string sh_quote(const string& s)
-{
-#ifdef _WIN32
-    string o = "\"";                        // cmd.exe: double quotes
-    for (char c : s) { if (c == '"') o += "\\\""; else o += c; }
-    return o + "\"";
-#else
-    string o = "'";
-    for (char c : s) { if (c == '\'') o += "'\\''"; else o += c; }
-    return o + "'";
-#endif
-}
-
 // Writes content to a fresh private temp file; returns its path ("" on error).
 static string make_temp(const string& content)
 {
@@ -968,15 +959,149 @@ static string make_temp(const string& content)
     return path;
 }
 
+#ifdef _WIN32
+static string windows_arg(const string& arg)
+{
+    bool quote = arg.empty() || arg.find_first_of(" \t\n\v\"") != string::npos;
+    if (!quote) return arg;
+
+    string out = "\"";
+    size_t slashes = 0;
+    for (char c : arg)
+    {
+        if (c == '\\') { ++slashes; continue; }
+        if (c == '"')
+        {
+            out.append(slashes * 2 + 1, '\\');
+            out += '"';
+            slashes = 0;
+            continue;
+        }
+        out.append(slashes, '\\');
+        slashes = 0;
+        out += c;
+    }
+    out.append(slashes * 2, '\\');
+    return out + '"';
+}
+#endif
+
+// Run an already-separated argument vector without passing through a shell.
+// Temporary files keep stdin/stdout deadlock-free even for large responses.
+static int run_command(const vector<string>& args, const string& input, string& output)
+{
+    if (args.empty()) return -1;
+    string input_path = make_temp(input), output_path = make_temp("");
+    if (input_path.empty() || output_path.empty())
+    {
+        if (!input_path.empty()) ::remove(input_path.c_str());
+        if (!output_path.empty()) ::remove(output_path.c_str());
+        return -1;
+    }
+
+    int status = -1;
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES inherit = { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
+    HANDLE input_handle = CreateFileA(input_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      &inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE output_handle = CreateFileA(output_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       &inherit, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (input_handle != INVALID_HANDLE_VALUE && output_handle != INVALID_HANDLE_VALUE)
+    {
+        string command;
+        for (const string& arg : args)
+        {
+            if (!command.empty()) command += ' ';
+            command += windows_arg(arg);
+        }
+        vector<char> mutable_command(command.begin(), command.end());
+        mutable_command.push_back('\0');
+        HANDLE error_handle = GetStdHandle(STD_ERROR_HANDLE);
+        vector<HANDLE> inherited_handles = { input_handle, output_handle };
+        if (error_handle != nullptr && error_handle != INVALID_HANDLE_VALUE)
+            inherited_handles.push_back(error_handle);
+
+        SIZE_T attribute_size = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
+        vector<unsigned char> attribute_storage(attribute_size);
+        LPPROC_THREAD_ATTRIBUTE_LIST attributes =
+            reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
+        bool attributes_ready = attribute_size != 0 &&
+            InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_size) != FALSE &&
+            UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                      inherited_handles.data(),
+                                      inherited_handles.size() * sizeof(HANDLE), nullptr, nullptr) != FALSE;
+
+        STARTUPINFOEXA startup = {};
+        startup.StartupInfo.cb = sizeof(startup);
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = input_handle;
+        startup.StartupInfo.hStdOutput = output_handle;
+        startup.StartupInfo.hStdError = error_handle;
+        startup.lpAttributeList = attributes_ready ? attributes : nullptr;
+        PROCESS_INFORMATION process = {};
+        DWORD creation_flags = attributes_ready ? EXTENDED_STARTUPINFO_PRESENT : 0;
+        if (CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, TRUE, creation_flags,
+                           nullptr, nullptr, &startup.StartupInfo, &process))
+        {
+            WaitForSingleObject(process.hProcess, INFINITE);
+            DWORD exit_code = 1;
+            GetExitCodeProcess(process.hProcess, &exit_code);
+            status = (int)exit_code;
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+        if (attributes_ready) DeleteProcThreadAttributeList(attributes);
+    }
+    if (input_handle != INVALID_HANDLE_VALUE) CloseHandle(input_handle);
+    if (output_handle != INVALID_HANDLE_VALUE) CloseHandle(output_handle);
+#else
+    pid_t child = fork();
+    if (child == 0)
+    {
+        int in = open(input_path.c_str(), O_RDONLY);
+        int out = open(output_path.c_str(), O_WRONLY | O_TRUNC);
+        if (in < 0 || out < 0) _exit(127);
+        dup2(in, STDIN_FILENO);
+        dup2(out, STDOUT_FILENO);
+        close(in);
+        close(out);
+        vector<char*> argv;
+        for (const string& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    if (child > 0 && waitpid(child, &status, 0) >= 0)
+    {
+        if (WIFEXITED(status)) status = WEXITSTATUS(status);
+        else status = 1;
+    }
+#endif
+
+    ifstream in(output_path, ios::binary);
+    output.assign((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    ::remove(input_path.c_str());
+    ::remove(output_path.c_str());
+    return status;
+}
+
+static string selected_mode(int argc, char** argv)
+{
+    return argc < 2 ? "chat" : argv[1];
+}
+
 static int usage()
 {
     cerr << "prosze - hide sensitive details from a prompt before it reaches an AI\n\n"
             "usage:\n"
+            "  prosze                         launch the native interactive chat\n"
             "  prosze chat    [opts]                 paste prompt -> safe text; paste reply -> real text\n"
             "  prosze redact  [opts] < prompt.txt    print the safe version\n"
             "  prosze restore [opts] < reply.txt     put the real values back\n"
             "  prosze check   [opts] < prompt.txt    exit code 1 if anything sensitive is found\n"
             "  prosze run     [opts] -- cmd args...  redact stdin/args, run cmd, restore its output\n\n"
+            "  prosze proxy   [opts] --upstream http://host:port  start native local proxy\n\n"
             "options:\n"
             "  --term \"Acme Corp\" | CUSTOMER=\"Acme Corp\"   hide a name (repeatable)\n"
             "  --terms FILE        names, one per line (./.prosze-terms is loaded automatically)\n"
@@ -1027,6 +1152,7 @@ static void chat(prosze& v, const string& map_path)
     }
 }
 
+#ifndef PROSZE_NO_MAIN
 int main(int argc, char** argv)
 {
     ios::sync_with_stdio(false);
@@ -1034,10 +1160,8 @@ int main(int argc, char** argv)
     _setmode(_fileno(stdin), _O_BINARY);    // no CRLF translation: keeps restore exact
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
-    if (argc < 2) return usage();
-
-    const string mode = argv[1];
-    string map_path = ".prosze-map", names = "normal";
+    const string mode = selected_mode(argc, argv);
+    string map_path = ".prosze-map", names = "normal", listen = "127.0.0.1:8787", upstream;
     bool explain = false;
     vector<string> envs, terms, term_files, cmd;
 
@@ -1051,10 +1175,12 @@ int main(int argc, char** argv)
         else if (a == "--terms") term_files.push_back(next());
         else if (a == "--names") names = next();
         else if (a == "--explain") explain = true;
+        else if (a == "--listen") listen = next();
+        else if (a == "--upstream") upstream = next();
         else if (a == "--") { for (++i; i < argc; ++i) cmd.push_back(argv[i]); }
         else return usage();
     }
-    if (mode != "chat" && mode != "redact" && mode != "restore" && mode != "check" && mode != "run")
+    if (mode != "chat" && mode != "redact" && mode != "restore" && mode != "check" && mode != "run" && mode != "proxy")
         return usage();
 
     prosze v;
@@ -1067,6 +1193,24 @@ int main(int argc, char** argv)
         if (!v.load_terms(f)) { cerr << "prosze: cannot read " << f << '\n'; return 1; }
     v.load_terms(".prosze-terms");          // optional, silent if absent
     for (auto& t : terms) v.add_term(t);
+
+    if (mode == "proxy")
+    {
+        if (upstream.empty()) { cerr << "prosze: proxy requires --upstream http://host:port\n"; return 2; }
+        size_t colon = listen.rfind(':');
+        if (colon == string::npos) { cerr << "prosze: --listen must be HOST:PORT\n"; return 2; }
+        ProszeProxyConfig config;
+        config.listen_host = listen.substr(0, colon);
+        unsigned long port = 0;
+        try { port = stoul(listen.substr(colon + 1)); }
+        catch (...) { cerr << "prosze: invalid listen port\n"; return 2; }
+        if (port == 0 || port > 65535) { cerr << "prosze: listen port must be 1..65535\n"; return 2; }
+        config.listen_port = static_cast<unsigned short>(port);
+        config.upstream = upstream;
+        return run_prosze_proxy(config,
+            [&](const string& text) { string safe = v.redact(text); if (v.dirty) v.save_map(map_path); return safe; },
+            [&](const string& text) { return v.restore(text); });
+    }
 
     if (mode == "chat") { chat(v, map_path); return 0; }
 
@@ -1094,30 +1238,22 @@ int main(int argc, char** argv)
 
     // run: nothing reaches the command unless it went through the redactor.
     if (cmd.empty()) return usage();
-    string cmdline;
-    for (auto& c : cmd) cmdline += sh_quote(v.redact(c)) + " ";   // args can hold secrets too
+    vector<string> safe_cmd;
+    for (auto& c : cmd) safe_cmd.push_back(v.redact(c));           // args can hold secrets too
     string safe = v.redact(isatty(0) ? string() : slurp_stdin());
     if (v.dirty && !v.save_map(map_path)) { cerr << "prosze: cannot write map\n"; return 1; }
 
-    string tmp = make_temp(safe);
-    if (tmp.empty()) { cerr << "prosze: cannot create temp file\n"; return 1; }
-    cmdline += "< " + sh_quote(tmp);
-#ifdef _WIN32
-    cmdline = "\"" + cmdline + "\"";        // cmd /c strips the outer quotes
-#endif
-    FILE* p = popen(cmdline.c_str(), "r");
-    if (!p) { ::remove(tmp.c_str()); cerr << "prosze: cannot run command\n"; return 1; }
-    string reply; char buf[4096]; size_t n;
-    while ((n = fread(buf, 1, sizeof buf, p)) > 0) reply.append(buf, n);
-    int status = pclose(p);
-    ::remove(tmp.c_str());
+    string reply;
+    int status = run_command(safe_cmd, safe, reply);
+    if (status < 0) { cerr << "prosze: cannot run command\n"; return 1; }
 
     cout << v.restore(reply);
     if (explain) v.print_fresh(cerr);
     cerr << "prosze: " << v.hits << " item(s) hidden before sending\n";
-#ifdef _WIN32
     return status;
-#else
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-#endif
 }
+#endif
+
+#ifndef PROSZE_PROXY_EXTERNAL
+#include "ProxyServer.cpp"
+#endif

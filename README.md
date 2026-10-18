@@ -1,178 +1,169 @@
 # Prosze
 
-**Hide sensitive details from your prompts _before_ they reach an AI.**
+Prosze is a local privacy shield. It replaces sensitive values with placeholders before text is sent to an AI or another command, then restores those values in returned text. Redaction is deterministic and local; no AI model is required for the core rules.
 
-Prosze is a local privacy shield: it redacts secrets, names, and PII from your text using regex rules, checksums, and heuristic name detection — **no AI needed for the redaction itself**. When the AI replies using the placeholders, Prosze restores the real values.
-
-```
-your prompt ──▶ prosze (redact) ──▶ AI ──▶ prosze (restore) ──▶ answer with real values
+```text
+prompt -> prosze (redact) -> AI or command -> prosze (restore) -> answer
 ```
 
-## Features
+## Delivered architecture
 
-- **Automatic detection** — phones, bank accounts / IBANs, emails, credit cards, SSNs, API keys / tokens / passwords, private keys, private IPs
-- **Name detection** — people, companies, customers, and projects found by capitalisation heuristics, context words (Dr, Dear, customer…), company suffixes (Inc, GmbH, Sp. z o.o.), and a built-in first-name dictionary — no AI model required
-- **Manual terms** — list names, projects, or companies via `--term` / `--terms` for exact matches
-- **Reversible mapping** — a local `.prosze-map` file keeps the placeholder↔real mapping so replies can be accurately restored
-- **.env integration** — load and hide every value from `.env` files
-- **Multiple interfaces** — C++ CLI, Python CLI, AI proxy server, interactive TUI with Hermes connector
+- **Native C++ CLI core**: dependency-free redaction, restoration, `.env` and term loading, TSV map persistence, checks, chat, and safe direct process execution.
+- **Native C++ proxy**: fast loopback HTTP proxy for plaintext `http://` upstreams. It redacts request bodies and restores response bodies, including SSE fragments.
+- **Python proxy and CLI**: provider-rich behavior, HTTPS upstream support, optional GLiNER name detection, and the interactive terminal UI.
+- **Privacy boundary**: the mapping file stays local. The proxy listens on loopback by default and sends only redacted content.
 
-## Project Structure
+The native and Python paths use the same placeholder style, but their detection coverage is not identical. Use the Python path when you need HTTPS upstreams, provider-specific behavior, or GLiNER.
 
-```
+## Project structure
+
+```text
 prosze/
-├── prosze/                 # Visual Studio C++ project
-│   └── Application.cpp     # Self-contained C++17 CLI (single file, no deps)
-├── new/prosze_ner_updated/  # Python package with enhanced features
-│   ├── prosze_proxy.py      # Python redaction engine + AI proxy server
-│   ├── hermes_connector.py  # Continuous streaming AI connector
-│   ├── tui.py               # Interactive Hermes-style terminal UI
-│   ├── prosze_cli/          # CLI entry point package
-│   ├── pyproject.toml       # Python packaging configuration
-│   └── prosze.cpp           # Enhanced C++ version with name detection
-├── NER-CPP/                 # Reference NER library (upstream, read-only)
-└── README.md
+  Application.cpp       Native CLI and command dispatcher
+  ProxyServer.h/.cpp    Native HTTP proxy implementation
+  tests/                Deterministic C++ tests and fixtures
+  prosze.vcxproj        Visual Studio project
+new/prosze_ner_updated/
+  prosze_proxy.py       Python CLI, redaction engine, and HTTPS-capable proxy
+  tui.py                Interactive terminal UI
+  hermes_connector.py   Optional streaming connector
+  prosze_cli/            Packaged Python entry point
+  tests/                Python tests
 ```
 
-## Quick Start
+## Build
 
-### C++ CLI (zero dependencies)
+### Native C++ (Linux/macOS/MinGW)
 
-Build the single-file C++ tool:
+`ProxyServer.cpp` is included by `Application.cpp`, so compile the application once:
 
 ```bash
-# Linux / macOS
-g++ -std=c++17 -O2 -o prosze prosze/Application.cpp
-
-# Windows (MSVC)
-cl /std:c++17 /O2 /EHsc prosze\Application.cpp
-
-# Windows (Visual Studio)
-# Open prosze/prosze.vcxproj and build (Debug or Release, x64)
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic prosze/Application.cpp -o prosze
 ```
 
-### Python CLI & Proxy
+On Windows MinGW, use `-lws2_32`:
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic prosze/Application.cpp -lws2_32 -o prosze.exe
+```
+
+### Native C++ (MSVC)
+
+```bat
+cl /std:c++17 /O2 /EHsc prosze\Application.cpp ws2_32.lib
+```
+
+Alternatively open `prosze/prosze.vcxproj` in Visual Studio and build the desired configuration. The native proxy requires Winsock linkage (`ws2_32.lib`).
+
+### Python CLI and proxy
 
 ```bash
 cd new/prosze_ner_updated
-pip install -e .
-
-# Optional: enable local GLiNER model for automatic name detection
-pip install -r requirements-ner.txt
+python -m pip install -e .
+# Optional local NER support:
+python -m pip install -r requirements-ner.txt
 ```
 
-After installation, running `prosze` with no subcommand launches the interactive CUI. If an older installed command still prints help, rerun `pip install -e .` from `new/prosze_ner_updated` to refresh the console entry point.
+After installation, the packaged `prosze` command with no subcommand launches the Python interactive CUI. If an old executable is selected, reinstall the editable package and verify the command path with `where prosze` (Windows) or `which prosze` (Unix).
 
 ## Usage
 
-### Commands
+The native binary and packaged Python command provide these core operations:
 
 ```bash
-# Launch the interactive terminal app
+# Native interactive chat when no subcommand is supplied
 prosze
 
-# Interactive chat mode — paste a prompt, get the safe version, paste the reply, get real text back
-prosze chat
-
-# Redact stdin and print the safe version
+# Redact or restore standard input
 prosze redact < prompt.txt
-
-# Restore placeholders back to real values
 prosze restore < reply.txt
 
-# Check if anything sensitive is found (exit code 1 if yes)
+# Exit with 1 when sensitive content is found
 prosze check < prompt.txt
 
-# Redact stdin and args, run a command, restore its output
-prosze run [options] -- curl -X POST https://api.example.com/chat
+# Redact stdin and command arguments, run directly, then restore output
+prosze run -- curl -X POST http://example.test/chat
 ```
 
-### Options
+Common options are supported by the native CLI and Python CLI:
 
-| Option | Description |
-|---|---|
-| `--term "Acme Corp"` | Hide this exact name (repeatable) |
-| `--term CUSTOMER="Acme Corp"` | Same, but placeholder becomes `[[CUSTOMER_1]]` |
-| `--terms FILE` | One term per line, optional `LABEL=value`, `#` comments |
-| `--env FILE` | Also hide every value from a `.env` file |
-| `--map FILE` | Mapping file path (default: `.prosze-map`) |
-| `--names LEVEL` | Name finder level: `off` \| `strict` \| `normal` (default) \| `aggressive` |
-| `--explain` | Print what was hidden (placeholder = real value) to stderr |
+```text
+--term "Acme Corp"       Add an exact term (repeatable)
+--term CUSTOMER="Acme"   Add a labelled term
+--terms FILE             Load terms from a file
+--env FILE               Hide values loaded from a .env file
+--map FILE               Select the local mapping file
+--names LEVEL            off, strict, normal, or aggressive
+--explain                 Print placeholder details to stderr
+```
 
-> **Note:** `.prosze-terms` is loaded automatically if present in the current directory.
+`.prosze-terms` is loaded automatically when present in the current directory. The native `run` command uses direct process execution rather than a shell, so command arguments are not reinterpreted by shell metacharacters.
 
-### Python-specific commands
+## Proxy modes
+
+### Native C++ plaintext proxy
+
+Build the native binary, then point it at a plaintext HTTP upstream:
 
 ```bash
-# Start the local AI proxy (for Claude Code, SDKs, etc.)
-prosze proxy --listen 127.0.0.1:8787 --upstream https://api.anthropic.com
+prosze proxy --listen 127.0.0.1:8787 --upstream http://127.0.0.1:9000
+```
 
-# Interactive TUI with Hermes connector
+The native proxy is loopback-only by default, supports JSON and SSE-style response data, applies framing and timeout limits, requests identity encoding, and closes malformed connections. It does **not** provide HTTPS upstream support. Do not pass an `https://` upstream to this mode.
+
+### Python proxy
+
+Use the installed Python command for HTTPS and provider-specific clients:
+
+```bash
+prosze proxy --listen 127.0.0.1:8787 --upstream https://api.anthropic.com
+```
+
+Point a compatible client at `http://127.0.0.1:8787`. The Python proxy handles HTTPS upstream connections and preserves provider-rich JSON/SSE behavior. Both proxy implementations should bind to `127.0.0.1`; binding publicly exposes the local mapping boundary.
+
+### Interactive Python UI
+
+```bash
 prosze tui
 ```
 
+The UI falls back cleanly in non-interactive terminals. `/redact` performs local redaction without requiring an API key; network-backed chat requires the configured provider credentials.
+
 ## Example
 
-**Input prompt:**
-```
-Dear Jan Kowalski,
-Your account PL61 1090 1014 0000 0712 1981 2874 has been debited.
-Contact us at jan.kowalski@acme.com or +48 601 234 567.
-API key: sk-proj-abc123def456ghi789
+```text
+Input:  Contact Jan Kowalski at jan.kowalski@example.com; token sk-example123.
+Safe:   Contact [[PERSON_1]] at [[EMAIL_1]]; token [[TOKEN_1]].
 ```
 
-**After `prosze redact`:**
-```
-Dear [[PERSON_1]],
-Your account [[IBAN_1]] has been debited.
-Contact us at [[EMAIL_1]] or [[PHONE_1]].
-API key: [[TOKEN_1]]
-```
+The mapping file translates placeholders back to the original values when a response is restored.
 
-The AI sees only placeholders. When it replies using `[[PERSON_1]]`, `prosze restore` puts the real values back.
+## Tests
 
-## Proxy Mode
-
-The proxy sits between your AI client and the API endpoint, automatically redacting outbound requests and restoring inbound responses — including SSE streams:
-
-```bash
-prosze proxy --listen 127.0.0.1:8787 --upstream https://api.anthropic.com
-
-# Then point your AI client to http://127.0.0.1:8787 instead of the real API
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-```
-
-## Recent Enhancements
-
-- The terminal CUI now handles non-interactive terminals gracefully, keeps vault values hidden, provides clearer status and error messages, and documents `/copy` consistently.
-- The local proxy validates upstream URLs and listen addresses, rejects ambiguous or oversized request bodies, closes connections after malformed framing, filters hop-by-hop headers, preserves upstream path prefixes, and handles SSE placeholder boundaries safely.
-- The packaged `prosze proxy` command reports invalid proxy addresses without a traceback.
-- Deterministic Python tests cover vault persistence, JSON redaction, OpenAI-style SSE restoration, proxy round trips, malformed framing, path handling, CUI fallback behavior, and vault privacy.
-
-Run the complete Python test suite from the repository root:
+Run the Python suite from the repository root:
 
 ```powershell
 python -m unittest discover -s new/prosze_ner_updated/tests -v
 ```
 
-The suite runs locally without downloading GLiNER or contacting external services. See [project_updates.md](project_updates.md) for the implementation and review history.
+Build and run the native tests:
 
-## Security Notes
+```powershell
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic prosze\Application.cpp -lws2_32 -o .tmp-prosze.exe
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic prosze\tests\ApplicationTests.cpp -lws2_32 -o .tmp-prosze-tests.exe
+.\.tmp-prosze-tests.exe
+```
 
-- The `.prosze-map` file contains real values in clear text — **keep it local and out of version control**
-- Add `.prosze-map` to your `.gitignore`
-- On Unix, the map file is created with mode `0600` (owner-only access)
-- The proxy should only listen on `127.0.0.1` — binding to other addresses exposes your secret map
+The tests are deterministic and do not contact external services or download models. Remove the temporary executables after local testing.
 
-## How It Works
+## Security and limitations
 
-1. **Regex rules** detect structured secrets (emails, tokens, IBANs, etc.) with validators (Luhn check for cards, IBAN mod-97, entropy for API keys)
-2. **Name heuristics** detect proper names by capitalisation patterns, honorifics, company suffixes, and a first-name dictionary — no ML model needed
-3. **Optional GLiNER** (Python only) adds local neural NER for better name coverage
-4. **Term lists** let you explicitly add names the heuristics might miss
-5. Each detected value gets a unique placeholder like `[[EMAIL_1]]`, stored in a bidirectional map
-6. On restore, placeholders are swapped back to real values
+- `.prosze-map` contains original values in clear text. Keep it local, restrict access, and add it to `.gitignore`.
+- The proxy must remain on loopback unless you have designed a separate protected deployment boundary.
+- Redaction is heuristic for names and cannot guarantee detection of every secret. Add important values with `--term`, `--terms`, or `--env`.
+- Native proxy support is plaintext HTTP only; use the Python proxy for HTTPS upstreams.
+- The native C++ and Python implementations are compatible in placeholder/map intent, but detection details can differ.
 
 ## License
 
-See [LICENSE](NER-CPP/LICENSE) for the NER-CPP reference library. The prosze tool itself is provided as-is.
+See [LICENSE](NER-CPP/LICENSE) for the reference NER-CPP library. The Prosze tool is provided as-is.

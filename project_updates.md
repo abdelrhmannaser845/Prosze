@@ -81,3 +81,40 @@ python -m compileall -q new/prosze_ner_updated
 ## Bare Command Launch
 
 The CLI entry point now launches the interactive CUI when `prosze` is run without a subcommand. Existing commands such as `prosze redact`, `prosze restore`, `prosze proxy`, and `prosze tui` remain available. A regression test confirms that an empty argument list dispatches to the TUI without consuming unrelated process arguments.
+
+
+## Project Completion Agents
+
+### Review agent
+
+- Compared the README contract with the checked-in implementation and identified the missing native proxy, C++ process-execution risks, compressed-response handling, and test gaps.
+- Established the delivery boundary: native C++ for deterministic core behavior and plaintext HTTP proxying; Python for HTTPS and provider-specific behavior.
+
+### C++ core agent
+
+- Updated `prosze/Application.cpp` so bare native invocation launches chat, `run` executes commands directly without shell construction, and exit codes are preserved.
+- Added native C++ tests and a TSV map fixture covering redaction, restoration, `.env`/map behavior, process forwarding, exit status, and bare invocation.
+- Verified native compilation, core tests, redaction/restoration, process execution, bare chat, and whitespace checks on Windows.
+
+### Proxy agent
+
+- Added `prosze/ProxyServer.h` and `prosze/ProxyServer.cpp`, integrated `prosze proxy`, and implemented loopback HTTP forwarding with request redaction, response restoration, SSE handling, framing limits, identity encoding, and socket timeouts.
+- Kept the native proxy explicitly limited to plaintext HTTP upstreams; the Python proxy remains the HTTPS/provider-rich path.
+- Hardened Python proxy response handling by requesting identity encoding and failing closed if an upstream still returns compressed content.
+- Added deterministic identity-encoding coverage and verified a native proxy round trip.
+
+### Documentation agent
+
+- Rewrote this README to describe the delivered native/Python split, bare-command behavior, build/link commands, proxy limitations, privacy boundary, usage, and test commands.
+- Preserved the earlier history and added this chronological completion record.
+
+### Completion validation
+
+- Native C++ build and tests passed with Winsock linkage.
+- Native proxy round-trip passed.
+- Python suite passed with 14 tests, and Python modules compiled successfully.
+- `git diff --check` passed for the delivered changes.
+### 2026-10-18 — Native proxy concurrency enhancement
+
+- The native C++ proxy now handles each accepted client on a detached worker thread, so a slow upstream request no longer blocks unrelated loopback clients.
+- Revalidated the C++ build, native tests, Python suite, CLI redaction/restoration, command exit propagation, and bare chat startup after the change.

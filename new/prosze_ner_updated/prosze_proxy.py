@@ -526,6 +526,9 @@ def make_handler(vault, upstream, verbose):
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in HOP and k.lower() not in connection_headers}
             headers["Host"] = u.netloc
+            # Restoration requires plaintext bytes.  Never allow an upstream
+            # gzip/br response to cross this boundary undecoded.
+            headers["Accept-Encoding"] = "identity"
             headers["Content-Length"] = str(len(body))
             conn = None
             try:
@@ -548,15 +551,12 @@ def make_handler(vault, upstream, verbose):
             ctype = (resp.getheader("Content-Type") or "").lower()
 
             try:
-                if encoded:                                  # cannot restore: pass through as-is
-                    data = resp.read()
-                    self.send_response(resp.status)
-                    for k, v in out_headers:
-                        self.send_header(k, v)
-                    self.send_header("Content-Encoding", resp.getheader("Content-Encoding"))
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
+                if encoded:
+                    # A compliant upstream should honor identity.  Failing
+                    # closed is safer than returning compressed data that may
+                    # still contain the original secret.
+                    resp.read()
+                    return self._fail(502, "upstream returned compressed content")
                 elif "text/event-stream" in ctype:
                     self.send_response(resp.status)
                     for k, v in out_headers:

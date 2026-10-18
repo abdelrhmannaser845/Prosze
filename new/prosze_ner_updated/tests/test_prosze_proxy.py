@@ -16,9 +16,11 @@ import prosze_proxy
 class UpstreamHandler(BaseHTTPRequestHandler):
     last_body = None
     last_path = None
+    last_encoding = None
 
     def do_POST(self):
         type(self).last_path = self.path
+        type(self).last_encoding = self.headers.get("Accept-Encoding")
         size = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(size)
         type(self).last_body = body
@@ -126,6 +128,7 @@ class ProxyBoundaryTests(unittest.TestCase):
             self.assertEqual(UpstreamHandler.last_body.decode(),
                              json.dumps({"message": placeholder}, ensure_ascii=False))
             self.assertEqual(UpstreamHandler.last_path, "/api/v1/messages?stream=false")
+            self.assertEqual(UpstreamHandler.last_encoding, "identity")
             self.assertEqual(result["reply"], secret)
 
 
