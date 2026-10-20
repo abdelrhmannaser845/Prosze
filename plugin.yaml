@@ -1,0 +1,22 @@
+name: prosze
+version: "1.0.0"
+description: "Zero-leak local privacy shield for Hermes Agent. Redacts sensitive credentials, tokens, PII, and custom terms before LLM and tool calls, and restores them in outputs."
+author: "NousResearch / Prosze"
+entrypoint: "new/prosze_ner_updated/prosze_plugin.py"
+python_dependencies:
+  - requests>=2.28.0
+capabilities:
+  provides_tools:
+    - prosze_redact
+    - prosze_restore
+    - prosze_check
+    - prosze_add_term
+    - prosze_vault_status
+    - prosze_clear_vault
+  provides_hooks:
+    - pre_api_request
+    - post_api_request
+    - pre_tool_call
+    - post_tool_call
+  provides_commands:
+    - prosze

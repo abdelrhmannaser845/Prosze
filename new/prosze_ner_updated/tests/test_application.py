@@ -125,10 +125,10 @@ class ApplicationTests(unittest.TestCase):
             self.assertEqual(restore_result.returncode, 0)
             self.assertEqual(restore_result.stdout, "Please contact Acme Corp.")
 
-    def test_bare_cli_launches_tui(self):
-        with patch("prosze_cli.tui_main") as launch_tui:
+    def test_bare_cli_launches_chat(self):
+        with patch("prosze_cli.cmd_chat") as launch_chat:
             cli_main([])
-        launch_tui.assert_called_once()
+        launch_chat.assert_called_once()
 
     def test_local_proxy_round_trip_redacts_upstream_and_restores_response(self):
         received = []

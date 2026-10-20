@@ -1,9 +1,10 @@
-"""Prosze CLI + TUI entry point.
+"""Prosze CLI + Hermes Agent Plugin entry point.
 
 Install:  pip install -e .
 Run:     prosze --help          (CLI mode)
-         prosze tui             (interactive TUI mode)
+         prosze                 (interactive CLI chat)
          prosze redact < file  (pipe stdin through redaction)
+         prosze plugin          (Hermes agent plugin info)
 """
 
 from __future__ import annotations
@@ -16,20 +17,11 @@ import sys
 from typing import Optional
 
 # ---- pull the real implementation from prosze_proxy.py -----------------
-# prosze_proxy.py lives in the project root (parent of this package).
-# The editable/pip install adds the project root to sys.path so it's
-# importable directly as a top-level module.
-# We prefer a normal import (works when the project root is on sys.path,
-# which both `pip install -e .` and the wrapper entry point do).  When that
-# fails we load prosze_proxy.py explicitly.
 try:
     import prosze_proxy as _mod  # noqa: F401
 except ImportError:
     import importlib.util
 
-    # When the project root isn't on sys.path (e.g. a non-editable install or
-    # the pip-generated wrapper invoking a different interpreter), inject it so
-    # prosze_proxy.py can be loaded as a top-level module.
     _proj = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if _proj not in sys.path:
         sys.path.insert(0, _proj)
@@ -55,6 +47,19 @@ BaseHTTPRequestHandler = _mod.BaseHTTPRequestHandler
 _chat = _mod.chat
 
 
+# ---- Hermes Agent plugin entrypoint hook --------------------------------
+def register(ctx: object) -> None:
+    """Plugin registration entry point for Hermes Agent."""
+    try:
+        import prosze_plugin
+    except ImportError:
+        _proj = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if _proj not in sys.path:
+            sys.path.insert(0, _proj)
+        import prosze_plugin
+    prosze_plugin.register(ctx)
+
+
 # ---- shared arg parsing -------------------------------------------------
 def build_common_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
@@ -66,18 +71,18 @@ def build_common_parser() -> argparse.ArgumentParser:
     return p
 
 
-def build_vault(args) -> Vault:
-    v = Vault(args.map)
-    if args.no_ner:
+def build_vault(args: argparse.Namespace) -> Vault:
+    v = Vault(getattr(args, "map", ".prosze-map"))
+    if getattr(args, "no_ner", False):
         v._ner_attempted = True
-    for p in args.env:
+    for p in getattr(args, "env", []):
         v.load_env(p)
-    tf = list(args.terms or [])
+    tf = list(getattr(args, "terms", []) or [])
     if os.path.exists(".prosze-terms"):
         tf.append(".prosze-terms")
     for p in tf:
         v.load_terms(p)
-    for t in args.term or []:
+    for t in getattr(args, "term", []) or []:
         v.add_term(t)
     return v
 
@@ -147,6 +152,15 @@ def cmd_proxy(v: Vault, listen: str, upstream: str, verbose: bool) -> None:
         pass
 
 
+def cmd_plugin(v: Vault) -> None:
+    """Print Hermes Agent plugin status and capabilities."""
+    try:
+        import prosze_plugin
+        print(prosze_plugin.handle_prosze_command())
+    except Exception as exc:
+        sys.stderr.write(f"prosze plugin error: {exc}\n")
+
+
 # ---- CLI ----------------------------------------------------------------
 def cli_main(argv: Optional[list[str]] = None) -> None:
     if argv is None:
@@ -158,12 +172,12 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         cli_args, cmd = argv, []
 
     if not cli_args:
-        cli_args = ["tui"]
+        cli_args = ["chat"]
 
     common = build_common_parser()
     ap = argparse.ArgumentParser(
         prog="prosze",
-        description="Remove sensitive details from prompts before they reach an AI.",
+        description="Remove sensitive details from prompts before they reach an AI (Hermes Agent & CLI).",
     )
     sub = ap.add_subparsers(dest="cmd")
     for name in ("chat", "redact", "restore", "check", "run"):
@@ -173,11 +187,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
     px.add_argument("--upstream", default="https://api.anthropic.com")
     px.add_argument("--verbose", action="store_true")
 
-    # TUI subparser with Hermes options
-    tui_p = sub.add_parser("tui", parents=[common])
-    tui_p.add_argument("--api-key", default=None, help="AI API key (Bearer / x-api-key)")
-    tui_p.add_argument("--api-base", default=None, help="API base URL (default: from Hermes config or Upstage)")
-    tui_p.add_argument("--api-model", default=None, help="Model name (default: from Hermes config)")
+    sub.add_parser("plugin", parents=[common], help="Show Hermes Agent plugin status")
 
     a = ap.parse_args(cli_args)
     if not a.cmd:
@@ -197,47 +207,19 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         cmd_run(v, cmd)
     elif a.cmd == "proxy":
         cmd_proxy(v, a.listen, a.upstream, a.verbose)
-    elif a.cmd == "tui":
-        tui_main(v, a)
+    elif a.cmd == "plugin":
+        cmd_plugin(v)
     else:
         ap.print_help()
 
 
-# ---- TUI ----------------------------------------------------------------
-def tui_main(v: Vault, a: Optional[argparse.Namespace] = None) -> None:
-    """Hermes-style TUI: interactive prompt console with continuous AI streaming,
-    multi-turn memory, and on-the-fly privacy redaction."""
-    try:
-        from tui import run_hermes_tui
-        from hermes_connector import HermesConfig
-    except (ImportError, ValueError):
-        _proj = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        if _proj not in sys.path:
-            sys.path.insert(0, _proj)
-        from tui import run_hermes_tui
-        from hermes_connector import HermesConfig
-
-    api_key = getattr(a, "api_key", None)
-    api_base = getattr(a, "api_base", None)
-    api_model = getattr(a, "api_model", None)
-
-    cfg = HermesConfig.load(
-        api_key=api_key,
-        api_base=api_base,
-        model=api_model,
-    )
-    run_hermes_tui(v, cfg)
-
-
-
 # ---- Hermes config readers (best-effort, non-fatal) ------------------------
-
 _HERMES_AUTH = os.path.expanduser("~/AppData/Local/hermes/auth.json")
 _HERMES_CONFIG = os.path.expanduser("~/AppData/Local/hermes/config.yaml")
 
 
 def _read_hermes_api_key() -> str:
-    """Try to pull a Solar/Upstage API key from Hermes's auth.json."""
+    """Try to pull an API key from Hermes's auth.json."""
     try:
         with open(_HERMES_AUTH, encoding="utf-8") as f:
             auth = json.load(f)
@@ -245,7 +227,7 @@ def _read_hermes_api_key() -> str:
         return ""
 
     providers = auth.get("providers") or {}
-    for name in ("upstage", "solar"):
+    for name in ("upstage", "solar", "nous", "openai", "anthropic"):
         entry = providers.get(name)
         if isinstance(entry, list) and entry:
             e = entry[0]
@@ -253,12 +235,10 @@ def _read_hermes_api_key() -> str:
             e = entry
         else:
             continue
-        # key may be stored as api_key, access_token, or a key_env reference
-        for field in ("api_key", "access_token"):
+        for field in ("api_key", "access_token", "agent_key"):
             val = e.get(field)
             if val and len(val) > 10:
                 return val
-        # if the provider points to an env var, try to read it
         env_var = e.get("key_env")
         if env_var:
             return os.environ.get(env_var, "")
@@ -272,8 +252,6 @@ def _read_hermes_base_url() -> str:
             text = f.read()
     except OSError:
         return ""
-    # minimal YAML parse — look for base_url under model.provider config
-    import re
     m = re.search(r"base_url:\s*[\"']?([^\"'#\n]+)", text)
     if m:
         return m.group(1).strip().rstrip("/")
@@ -287,12 +265,9 @@ def _read_hermes_model() -> str:
             text = f.read()
     except OSError:
         return ""
-    import re
-    # look for model.default (the value after "default:" under "model:")
     m = re.search(r"^\s*model:\s*\n\s+default:\s*[\"']?([^\"'#\n]+)", text, re.M)
     if m:
         return m.group(1).strip()
-    # fallback: any top-level model: value
     m = re.search(r"^\s*model:\s*[\"']?([^\"'#\n]+)", text, re.M)
     if m:
         return m.group(1).strip()
