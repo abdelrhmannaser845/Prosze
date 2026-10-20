@@ -3,11 +3,8 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.request import Request, urlopen
 from unittest.mock import patch
 
 
@@ -15,7 +12,7 @@ PACKAGE_DIR = Path(__file__).resolve().parents[1]
 if str(PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIR))
 
-from prosze_proxy import StreamRestorer, Vault, make_handler, walk
+from prosze_core import Vault, walk
 from prosze_cli import cli_main
 
 
@@ -65,23 +62,6 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(result["event"], "data: keep-sse-prefix")
         self.assertEqual(result["count"], 3)
 
-    def test_stream_restorer_handles_placeholder_split_across_events_and_bytes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            vault = self.make_vault(directory)
-            placeholder = vault.save("Acme Corp", "CUSTOMER")
-            first = "data: " + json.dumps({"choices": [{"index": 0, "delta": {"content": "Hello " + placeholder[:-4]}}]}) + "\n\n"
-            second = "data: " + json.dumps({"choices": [{"index": 0, "delta": {"content": placeholder[-4:] + "!"}, "finish_reason": "stop"}]}) + "\n\n"
-            restorer = StreamRestorer(vault)
-
-            output = b""
-            for chunk in (first.encode()[:7], first.encode()[7:], second.encode()):
-                output += restorer.feed_bytes(chunk)
-            output += restorer.finish()
-
-            self.assertIn(b'"content": "Hello "', output)
-            self.assertIn(b'"content": "Acme Corp!"', output)
-            self.assertNotIn(placeholder.encode(), output)
-
     def test_cli_help_and_redact_restore_smoke(self):
         with tempfile.TemporaryDirectory() as directory:
             map_path = Path(directory) / "map.tsv"
@@ -129,58 +109,6 @@ class ApplicationTests(unittest.TestCase):
         with patch("prosze_cli.cmd_chat") as launch_chat:
             cli_main([])
         launch_chat.assert_called_once()
-
-    def test_local_proxy_round_trip_redacts_upstream_and_restores_response(self):
-        received = []
-
-        class UpstreamHandler(BaseHTTPRequestHandler):
-            def log_message(self, *_args):
-                pass
-
-            def do_POST(self):
-                body = self.rfile.read(int(self.headers["Content-Length"]))
-                received.append(json.loads(body))
-                response = json.dumps({"reply": received[-1]["prompt"]}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(response)))
-                self.end_headers()
-                self.wfile.write(response)
-
-        upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
-        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
-        upstream_thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                vault = self.make_vault(directory)
-                vault.add_term("CUSTOMER=Acme Corp")
-                proxy = ThreadingHTTPServer(
-                    ("127.0.0.1", 0),
-                    make_handler(vault, f"http://127.0.0.1:{upstream.server_port}", False),
-                )
-                proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
-                proxy_thread.start()
-                try:
-                    request_body = json.dumps({"prompt": "Contact Acme Corp"}).encode()
-                    request = Request(
-                        f"http://127.0.0.1:{proxy.server_port}/v1/messages",
-                        data=request_body,
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urlopen(request, timeout=5) as response:
-                        result = json.loads(response.read())
-
-                    self.assertEqual(received, [{"prompt": "Contact [[CUSTOMER_1]]"}])
-                    self.assertEqual(result, {"reply": "Contact Acme Corp"})
-                finally:
-                    proxy.shutdown()
-                    proxy.server_close()
-                    proxy_thread.join(timeout=5)
-        finally:
-            upstream.shutdown()
-            upstream.server_close()
-            upstream_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

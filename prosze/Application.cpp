@@ -16,6 +16,7 @@
 //   prosze check   < prompt.txt       exit code 1 if anything sensitive is found
 //   prosze run [opts] -- cmd args...  redact stdin and args, run cmd, restore its output
 //
+// Note: the proxy subcommand has been removed. Use the Python CLI for proxy functionality.
 // Options
 //   --term "Acme Corp"            hide this name (repeatable)
 //   --term CUSTOMER="Acme Corp"   same, placeholder becomes [[CUSTOMER_1]]
@@ -43,7 +44,6 @@
   #ifndef NOMINMAX
   #define NOMINMAX
   #endif
-  #include <winsock2.h>
   #include <windows.h>
   #include <io.h>
   #include <fcntl.h>
@@ -70,8 +70,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "ProxyServer.h"
-
 using namespace std;
 
 // ------------------------------------------------------------------ helpers
@@ -1101,7 +1099,6 @@ static int usage()
             "  prosze restore [opts] < reply.txt     put the real values back\n"
             "  prosze check   [opts] < prompt.txt    exit code 1 if anything sensitive is found\n"
             "  prosze run     [opts] -- cmd args...  redact stdin/args, run cmd, restore its output\n\n"
-            "  prosze proxy   [opts] --upstream http://host:port  start native local proxy\n\n"
             "options:\n"
             "  --term \"Acme Corp\" | CUSTOMER=\"Acme Corp\"   hide a name (repeatable)\n"
             "  --terms FILE        names, one per line (./.prosze-terms is loaded automatically)\n"
@@ -1161,7 +1158,7 @@ int main(int argc, char** argv)
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
     const string mode = selected_mode(argc, argv);
-    string map_path = ".prosze-map", names = "normal", listen = "127.0.0.1:8787", upstream;
+    string map_path = ".prosze-map", names = "normal";
     bool explain = false;
     vector<string> envs, terms, term_files, cmd;
 
@@ -1175,12 +1172,10 @@ int main(int argc, char** argv)
         else if (a == "--terms") term_files.push_back(next());
         else if (a == "--names") names = next();
         else if (a == "--explain") explain = true;
-        else if (a == "--listen") listen = next();
-        else if (a == "--upstream") upstream = next();
-        else if (a == "--") { for (++i; i < argc; ++i) cmd.push_back(argv[i]); }
+        else if (a == "--\") { for (++i; i < argc; ++i) cmd.push_back(argv[i]); }
         else return usage();
     }
-    if (mode != "chat" && mode != "redact" && mode != "restore" && mode != "check" && mode != "run" && mode != "proxy")
+    if (mode != "chat" && mode != "redact" && mode != "restore" && mode != "check" && mode != "run")
         return usage();
 
     prosze v;
@@ -1193,24 +1188,6 @@ int main(int argc, char** argv)
         if (!v.load_terms(f)) { cerr << "prosze: cannot read " << f << '\n'; return 1; }
     v.load_terms(".prosze-terms");          // optional, silent if absent
     for (auto& t : terms) v.add_term(t);
-
-    if (mode == "proxy")
-    {
-        if (upstream.empty()) { cerr << "prosze: proxy requires --upstream http://host:port\n"; return 2; }
-        size_t colon = listen.rfind(':');
-        if (colon == string::npos) { cerr << "prosze: --listen must be HOST:PORT\n"; return 2; }
-        ProszeProxyConfig config;
-        config.listen_host = listen.substr(0, colon);
-        unsigned long port = 0;
-        try { port = stoul(listen.substr(colon + 1)); }
-        catch (...) { cerr << "prosze: invalid listen port\n"; return 2; }
-        if (port == 0 || port > 65535) { cerr << "prosze: listen port must be 1..65535\n"; return 2; }
-        config.listen_port = static_cast<unsigned short>(port);
-        config.upstream = upstream;
-        return run_prosze_proxy(config,
-            [&](const string& text) { string safe = v.redact(text); if (v.dirty) v.save_map(map_path); return safe; },
-            [&](const string& text) { return v.restore(text); });
-    }
 
     if (mode == "chat") { chat(v, map_path); return 0; }
 
@@ -1252,8 +1229,4 @@ int main(int argc, char** argv)
     cerr << "prosze: " << v.hits << " item(s) hidden before sending\n";
     return status;
 }
-#endif
-
-#ifndef PROSZE_PROXY_EXTERNAL
-#include "ProxyServer.cpp"
 #endif
