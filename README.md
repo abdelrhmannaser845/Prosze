@@ -121,4 +121,4 @@ The tests are deterministic and do not contact external services or download mod
 
 ## License
 
-See [LICENSE](NER-CPP/LICENSE) for the reference NER-CPP library. The Prosze tool is provided as-is.
+See [LICENSE](LICENSE). The Prosze tool is provided as-is.
