@@ -31,17 +31,19 @@ def build_common_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-ner", action="store_true", help="disable GLiNER name detection")
     p.add_argument("--ephemeral", action="store_true", help="keep mapping in memory only, never write to disk")
     p.add_argument("--passphrase", default=None, metavar="KEY", help="encrypt mapping file with KEY (or PROSZE_KEY env)")
+    p.add_argument("--strict-restore", action="store_true", help="only restore placeholders redacted during this session")
     return p
 
 
 def build_vault(args: argparse.Namespace) -> Vault:
     ephemeral = getattr(args, "ephemeral", False)
     passphrase = getattr(args, "passphrase", None)
-    if passphrase is None:
+    if not passphrase:
         env_key = os.environ.get("PROSZE_KEY")
         if env_key:
             passphrase = env_key
-    v = Vault(getattr(args, "map", ".prosze-map"), ephemeral=ephemeral, passphrase=passphrase)
+    strict_restore = getattr(args, "strict_restore", False)
+    v = Vault(getattr(args, "map", ".prosze-map"), ephemeral=ephemeral, passphrase=passphrase, strict_restore=strict_restore)
     if getattr(args, "no_ner", False):
         v._ner_attempted = True
     for p in getattr(args, "env", []):
@@ -83,6 +85,7 @@ def cmd_run(v: Vault, cmd: list[str]) -> None:
     import subprocess
     if not cmd:
         sys.exit("prosze: usage: prosze run [options] -- command args...")
+    v.strict_restore = True
     exe = shutil.which(cmd[0])
     if not exe:
         sys.exit(f"prosze: command not found: {cmd[0]}")

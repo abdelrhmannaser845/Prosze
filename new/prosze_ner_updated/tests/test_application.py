@@ -257,6 +257,183 @@ class ApplicationTests(unittest.TestCase):
         self.assertNotIn("hermes_agent.plugins", project.get("entry-points", {}))
         self.assertEqual(project.get("dependencies"), [])
 
+    def test_strict_restore_blocks_preloaded_placeholders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path = Path(directory) / "map.tsv"
+            with open(map_path, "w", encoding="utf-8") as f:
+                f.write("[[CUSTOMER_1]]\tAcme Corp\n[[TOKEN_1]]\tsuper-secret-token\n")
+
+            # Default mode (strict_restore=False)
+            v_default = Vault(str(map_path), strict_restore=False)
+            v_default._ner_attempted = True
+            self.assertEqual(
+                v_default.restore("Hello [[CUSTOMER_1]] and [[TOKEN_1]]"),
+                "Hello Acme Corp and super-secret-token",
+            )
+
+            # strict_restore=True
+            v_strict = Vault(str(map_path), strict_restore=True)
+            v_strict._ner_attempted = True
+
+            # Before any redaction, nothing is in session_keys: both remain placeholders
+            self.assertEqual(
+                v_strict.restore("Hello [[CUSTOMER_1]] and [[TOKEN_1]]"),
+                "Hello [[CUSTOMER_1]] and [[TOKEN_1]]",
+            )
+
+            # Redacting Acme Corp registers [[CUSTOMER_1]] into session_keys
+            v_strict.add_term("CUSTOMER=Acme Corp")
+            safe, n = v_strict.redact("We are contacting Acme Corp today.")
+            self.assertEqual(safe, "We are contacting [[CUSTOMER_1]] today.")
+            self.assertIn("[[CUSTOMER_1]]", v_strict.session_keys)
+            self.assertNotIn("[[TOKEN_1]]", v_strict.session_keys)
+
+            # Only [[CUSTOMER_1]] is restored, [[TOKEN_1]] remains blocked
+            self.assertEqual(
+                v_strict.restore("Hello [[CUSTOMER_1]] and [[TOKEN_1]]"),
+                "Hello Acme Corp and [[TOKEN_1]]",
+            )
+
+            # CLI verification of --strict-restore flag
+            command = [sys.executable, "-m", "prosze_cli"]
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(PACKAGE_DIR)
+
+            res_normal = subprocess.run(
+                command + ["restore", "--no-ner", "--map", str(map_path)],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Customer: [[CUSTOMER_1]]",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res_normal.returncode, 0)
+            self.assertEqual(res_normal.stdout, "Customer: Acme Corp")
+
+            res_strict = subprocess.run(
+                command + ["restore", "--no-ner", "--strict-restore", "--map", str(map_path)],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Customer: [[CUSTOMER_1]]",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res_strict.returncode, 0)
+            self.assertEqual(res_strict.stdout, "Customer: [[CUSTOMER_1]]")
+
+    def test_cloud_and_ai_secret_rules_and_ips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+
+            # Hugging Face token
+            hf = "hf_012345678901234567890123456789"
+            s1, _ = v.redact(f"HuggingFace: {hf}")
+            self.assertEqual(s1, "HuggingFace: [[TOKEN_1]]")
+            self.assertEqual(v.restore(s1), f"HuggingFace: {hf}")
+
+            # GitHub fine-grained PAT
+            pat = "github_pat_11ABCD0123456789012345"
+            s2, _ = v.redact(f"GitHub PAT: {pat}")
+            self.assertEqual(s2, "GitHub PAT: [[TOKEN_2]]")
+            self.assertEqual(v.restore(s2), f"GitHub PAT: {pat}")
+
+            # Slack incoming webhook
+            slack_prefix = "https://hooks.slack.com/services/"
+            slack = f"{slack_prefix}T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+            s3, _ = v.redact(f"Slack Webhook: {slack}")
+            self.assertEqual(s3, "Slack Webhook: [[TOKEN_3]]")
+            self.assertEqual(v.restore(s3), f"Slack Webhook: {slack}")
+
+            # Anthropic / OpenAI / Stripe tokens
+            ant = "sk-ant-api03-abcdef1234567890"
+            s4, _ = v.redact(f"Anthropic: {ant}")
+            self.assertEqual(s4, "Anthropic: [[TOKEN_4]]")
+            self.assertEqual(v.restore(s4), f"Anthropic: {ant}")
+
+            sk_proj = "sk-proj-abcdef1234567890"
+            s5, _ = v.redact(f"OpenAI: {sk_proj}")
+            self.assertEqual(s5, "OpenAI: [[TOKEN_5]]")
+            self.assertEqual(v.restore(s5), f"OpenAI: {sk_proj}")
+
+            sk_live = "sk_live_abcdef1234567890"
+            s6, _ = v.redact(f"Stripe: {sk_live}")
+            self.assertEqual(s6, "Stripe: [[TOKEN_6]]")
+            self.assertEqual(v.restore(s6), f"Stripe: {sk_live}")
+
+            rk_live = "rk_live_abcdef1234567890"
+            s7, _ = v.redact(f"Stripe restricted: {rk_live}")
+            self.assertEqual(s7, "Stripe restricted: [[TOKEN_7]]")
+            self.assertEqual(v.restore(s7), f"Stripe restricted: {rk_live}")
+
+            # Cloud metadata IP
+            s_meta, _ = v.redact("AWS metadata IP: 169.254.169.254")
+            self.assertEqual(s_meta, "AWS metadata IP: [[IP_1]]")
+            self.assertEqual(v.restore(s_meta), "AWS metadata IP: 169.254.169.254")
+
+            # Link-local IPv4
+            s_ll4, _ = v.redact("Link-local IPv4: 169.254.10.20")
+            self.assertEqual(s_ll4, "Link-local IPv4: [[IP_2]]")
+            self.assertEqual(v.restore(s_ll4), "Link-local IPv4: 169.254.10.20")
+
+            # IPv6 ULA
+            s_ula1, _ = v.redact("IPv6 ULA prefix: fd00::")
+            self.assertEqual(s_ula1, "IPv6 ULA prefix: [[IP_3]]")
+            self.assertEqual(v.restore(s_ula1), "IPv6 ULA prefix: fd00::")
+
+            s_ula2, _ = v.redact("IPv6 ULA addr: fd12:3456:789a:1::1")
+            self.assertEqual(s_ula2, "IPv6 ULA addr: [[IP_4]]")
+            self.assertEqual(v.restore(s_ula2), "IPv6 ULA addr: fd12:3456:789a:1::1")
+
+            # IPv6 link-local
+            s_ll6_1, _ = v.redact("IPv6 link-local prefix: fe80::")
+            self.assertEqual(s_ll6_1, "IPv6 link-local prefix: [[IP_5]]")
+            self.assertEqual(v.restore(s_ll6_1), "IPv6 link-local prefix: fe80::")
+
+            s_ll6_2, _ = v.redact("IPv6 link-local host: fe80::1")
+            self.assertEqual(s_ll6_2, "IPv6 link-local host: [[IP_6]]")
+            self.assertEqual(v.restore(s_ll6_2), "IPv6 link-local host: fe80::1")
+
+            s_ll6_3, _ = v.redact("IPv6 link-local full: fe80::20c:29ff:fe4b:8a12")
+            self.assertEqual(s_ll6_3, "IPv6 link-local full: [[IP_7]]")
+            self.assertEqual(v.restore(s_ll6_3), "IPv6 link-local full: fe80::20c:29ff:fe4b:8a12")
+
+            # Public IPs should not be redacted
+            pub = "Public DNS: 8.8.8.8 and 2001:db8::1"
+            safe_pub, n = v.redact(pub)
+            self.assertEqual(safe_pub, pub)
+            self.assertEqual(n, 0)
+
+    def test_base64_encoded_secret_scanner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+
+            # Base64 of "Bearer sk-example1234567890abcdef"
+            b64_token = "QmVhcmVyIHNrLWV4YW1wbGUxMjM0NTY3ODkwYWJjZGVm"
+            s1, n1 = v.redact(f"Authorization: {b64_token}")
+            self.assertEqual(s1, "Authorization: [[ENCODED_1]]")
+            self.assertEqual(n1, 1)
+            self.assertEqual(v.restore(s1), f"Authorization: {b64_token}")
+
+            # Base64 of "password=supersecret123"
+            b64_pwd = "cGFzc3dvcmQ9c3VwZXJzZWNyZXQxMjM="
+            s2, n2 = v.redact(f"Payload: {b64_pwd}")
+            self.assertEqual(s2, "Payload: [[ENCODED_2]]")
+            self.assertEqual(n2, 1)
+            self.assertEqual(v.restore(s2), f"Payload: {b64_pwd}")
+
+            # Plain English base64
+            b64_plain = "TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQsIGNvbnNlY3RldHVyIGFkaXBpc2NpbmcgZWxpdC4="
+            s3, n3 = v.redact(f"Public note: {b64_plain}")
+            self.assertEqual(s3, f"Public note: {b64_plain}")
+            self.assertEqual(n3, 0)
+
+            # strict_restore verification on ENCODED placeholders
+            v.strict_restore = True
+            self.assertEqual(v.restore(s1), f"Authorization: {b64_token}")
+            self.assertEqual(v.restore("[[ENCODED_99]]"), "[[ENCODED_99]]")
+
 
 if __name__ == "__main__":
     unittest.main()

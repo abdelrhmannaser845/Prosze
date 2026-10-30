@@ -160,8 +160,8 @@ static bool private_ip(const string& s)
 {
     int a, b, c, d;
     if (sscanf(s.c_str(), "%d.%d.%d.%d", &a, &b, &c, &d) != 4) return false;
-    if (a > 255 || b > 255 || c > 255 || d > 255) return false;
-    return a == 10 || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31);
+    if (a < 0 || b < 0 || c < 0 || d < 0 || a > 255 || b > 255 || c > 255 || d > 255) return false;
+    return a == 10 || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31) || (a == 169 && b == 254);
 }
 
 static bool phone_labeled_ok(const string& s) { int n = count_digits(s); return n >= 6 && n <= 15; }
@@ -173,6 +173,108 @@ static bool phone_sep_ok(const string& s)
     static const regex date(R"(^\d{4}-\d{1,2}-\d{1,2})");
     int n = count_digits(s);
     return n >= 9 && n <= 15 && !regex_search(s, date);
+}
+
+// ------------------------------------------------ Base64 & UTF-8 validators
+static bool is_valid_utf8(const string& s)
+{
+    size_t i = 0;
+    while (i < s.size())
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c <= 0x7F)
+        {
+            ++i;
+        }
+        else if ((c & 0xE0) == 0xC0)
+        {
+            if (c < 0xC2 || i + 1 >= s.size() || ((unsigned char)s[i + 1] & 0xC0) != 0x80) return false;
+            i += 2;
+        }
+        else if ((c & 0xF0) == 0xE0)
+        {
+            if (i + 2 >= s.size() || ((unsigned char)s[i + 1] & 0xC0) != 0x80 || ((unsigned char)s[i + 2] & 0xC0) != 0x80) return false;
+            if (c == 0xE0 && (unsigned char)s[i + 1] < 0xA0) return false;
+            if (c == 0xED && (unsigned char)s[i + 1] >= 0xA0) return false;
+            i += 3;
+        }
+        else if ((c & 0xF8) == 0xF0)
+        {
+            if (i + 3 >= s.size() || ((unsigned char)s[i + 1] & 0xC0) != 0x80 || ((unsigned char)s[i + 2] & 0xC0) != 0x80 || ((unsigned char)s[i + 3] & 0xC0) != 0x80) return false;
+            if (c == 0xF0 && (unsigned char)s[i + 1] < 0x90) return false;
+            if (c == 0xF4 && (unsigned char)s[i + 1] > 0x8F) return false;
+            if (c > 0xF4) return false;
+            i += 4;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_printable_utf8(const string& s)
+{
+    if (s.empty()) return false;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\t' || c == '\r' || c == '\n') continue;
+        if (c < 0x20 || c == 0x7F) return false;
+    }
+    return is_valid_utf8(s);
+}
+
+static bool b64_decode(const string& input, string& out)
+{
+    out.clear();
+    if (input.empty()) return false;
+    size_t rem = input.size() % 4;
+    if (rem == 1) return false;
+    string padded = input;
+    if (rem == 2) padded.append("==");
+    else if (rem == 3) padded.append("=");
+
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        if (c == '=') return -2;
+        return -1;
+    };
+
+    out.reserve((padded.size() / 4) * 3);
+    for (size_t i = 0; i < padded.size(); i += 4)
+    {
+        int b0 = val(padded[i]);
+        int b1 = val(padded[i + 1]);
+        int b2 = val(padded[i + 2]);
+        int b3 = val(padded[i + 3]);
+
+        if (b0 < 0 || b1 < 0) return false;
+        if (b2 == -2)
+        {
+            if (b3 != -2 || i + 4 != padded.size()) return false;
+            out.push_back((char)((b0 << 2) | (b1 >> 4)));
+        }
+        else if (b3 == -2)
+        {
+            if (b2 < 0 || i + 4 != padded.size()) return false;
+            out.push_back((char)((b0 << 2) | (b1 >> 4)));
+            out.push_back((char)(((b1 & 0xF) << 4) | (b2 >> 2)));
+        }
+        else
+        {
+            if (b2 < 0 || b3 < 0) return false;
+            out.push_back((char)((b0 << 2) | (b1 >> 4)));
+            out.push_back((char)(((b1 & 0xF) << 4) | (b2 >> 2)));
+            out.push_back((char)(((b2 & 0x3) << 6) | b3));
+        }
+    }
+    return true;
 }
 
 // ------------------------------------------------------- mapping file escapes
@@ -851,6 +953,8 @@ class prosze
 public:
     string passphrase;
     bool ephemeral = false;
+    bool strict_restore = false;
+    set<string> session_keys;
     vector<pair<string, string>> fresh;      // placeholders created by the last redact()
     int name_level = 2;                      // 0 off, 1 strict, 2 normal, 3 aggressive
     size_t hits = 0;
@@ -906,6 +1010,7 @@ public:
 
         zero_str(passphrase);
         passphrase.clear();
+        session_keys.clear();
     }
 
     prosze()
@@ -918,6 +1023,9 @@ public:
 
         add("TOKEN", R"RX(\b(?:AKIA|ASIA)[A-Z0-9]{16}\b)RX");
         add("TOKEN", R"RX(\bAIza[0-9A-Za-z_\-]{35}\b)RX");
+        add("TOKEN", R"RX(\bhf_[A-Za-z0-9]{30,}\b)RX");
+        add("TOKEN", R"RX(\bgithub_pat_[A-Za-z0-9_]{20,}\b)RX");
+        add("TOKEN", R"RX(https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+)RX");
         add("TOKEN", R"RX(\b(?:sk|pk|rk|ghp|gho|ghs|ghu|glpat|xox[baprs])[-_][A-Za-z0-9_\-]{12,}\b)RX");
         add("TOKEN", R"RX(\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b)RX");
         add("TOKEN", R"RX(\bBearer\s+([A-Za-z0-9_\-\.=]{16,}))RX", 1, not_placeholder);
@@ -941,6 +1049,7 @@ public:
         add("APIKEY", R"RX(\b[A-Za-z0-9]{32}\b)RX", 0, looks_random);
         add("APIKEY", R"RX(\b[A-Fa-f0-9]{40,64}\b)RX");
         add("IP", R"RX(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)RX", 0, private_ip);
+        add("IP", R"RX(\b(?:f[cd][0-9a-f]{2}|fe80):(?:[0-9a-f:]*:[0-9a-f]+|:)(?!:))RX", 0, nullptr, true);
 
         // std::regex has no look-behind: the leading boundary is captured in
         // group 1 and only group 2 (the number) is replaced.
@@ -1025,14 +1134,20 @@ public:
     {
         ++hits;
         auto it = backward.find(value);
-        if (it != backward.end()) return it->second;
+        if (it != backward.end()) {
+            session_keys.insert(it->second);
+            return it->second;
+        }
 
         bool is_term = term_cats.count(cat) > 0;
         string fk = cat + '\x01' + lower(value);
         if (is_term)
         {
             auto f = fold.find(fk);
-            if (f != fold.end()) return f->second;   // same name, other capitalisation
+            if (f != fold.end()) {
+                session_keys.insert(f->second);
+                return f->second;   // same name, other capitalisation
+            }
         }
         string key = "[[" + cat + "_" + to_string(++counters[cat]) + "]]";
         backward[value] = key;
@@ -1040,6 +1155,7 @@ public:
         if (is_term) fold[fk] = key;
         dirty = true;
         fresh.push_back({ key, value });
+        session_keys.insert(key);
         return key;
     }
 
@@ -1049,6 +1165,7 @@ public:
         string t = replace_literals(input);
         t = replace_key_blocks(t);
         for (const Rule& r : rules) t = apply(t, r);
+        t = replace_base64_secrets(t);
         for (const Term& term : terms) t = replace_term(t, term);   // listed + learned names
         return auto_names(t);                                       // names nobody listed
     }
@@ -1092,7 +1209,9 @@ public:
         for (auto it = sregex_iterator(input.begin(), input.end(), ph);
              it != sregex_iterator(); ++it)
         {
-            auto f = forward.find(it->str());
+            string key = it->str();
+            if (strict_restore && session_keys.count(key) == 0) continue;
+            auto f = forward.find(key);
             if (f == forward.end()) continue;
             out.append(input, last, it->position(0) - last);
             out.append(f->second);
@@ -1253,7 +1372,11 @@ private:
     {
         string lk = lower(value);
         auto it = name_fold.find(lk);
-        if (it != name_fold.end()) { ++hits; return it->second; }
+        if (it != name_fold.end()) {
+            ++hits;
+            session_keys.insert(it->second);
+            return it->second;
+        }
         string key = save(value, cat);
         name_fold[lk] = key;
         return key;
@@ -1366,6 +1489,82 @@ private:
             if (r.validate && !r.validate(value)) continue;
             out.append(text, last, start - last);
             out.append(save(value, r.cat));
+            last = start + len;
+        }
+        out.append(text, last, string::npos);
+        return out;
+    }
+
+    bool contains_secret(const string& decoded) const
+    {
+        for (const auto& [lit, cat] : literals)
+        {
+            if (decoded.find(lit) != string::npos) return true;
+        }
+        size_t b = decoded.find("-----BEGIN ");
+        if (b != string::npos)
+        {
+            size_t he = decoded.find("-----", b + 11);
+            if (he != string::npos)
+            {
+                string label = decoded.substr(b + 11, he - b - 11);
+                if (label.find("PRIVATE KEY") != string::npos)
+                    return true;
+            }
+        }
+        for (const Rule& r : rules)
+        {
+            for (auto it = sregex_iterator(decoded.begin(), decoded.end(), r.rx);
+                 it != sregex_iterator(); ++it)
+            {
+                const smatch& m = *it;
+                if (r.group < m.size() && m[r.group].matched)
+                {
+                    string val = m.str(r.group);
+                    if (!val.empty() && (!r.validate || r.validate(val)))
+                        return true;
+                }
+            }
+        }
+        for (const Term& term : terms)
+        {
+            const string low = lower(decoded);
+            const string& t = term.low;
+            size_t pos = 0;
+            while ((pos = low.find(t, pos)) != string::npos)
+            {
+                size_t end = pos + t.size();
+                bool lb = !word_char((unsigned char)t.front()) || pos == 0 || !word_char((unsigned char)decoded[pos - 1]);
+                bool rb = !word_char((unsigned char)t.back()) || end == decoded.size() || !word_char((unsigned char)decoded[end]);
+                if (lb && rb) return true;
+                ++pos;
+            }
+        }
+        return false;
+    }
+
+    string replace_base64_secrets(const string& text)
+    {
+        static const regex b64_cand(R"RX(\b[A-Za-z0-9+/]{24,}(?:={1,2}(?![A-Za-z0-9+/=])|\b))RX");
+        string out; size_t last = 0;
+        for (auto it = sregex_iterator(text.begin(), text.end(), b64_cand);
+             it != sregex_iterator(); ++it)
+        {
+            string cand = it->str();
+            size_t start = (size_t)it->position();
+            size_t len = (size_t)it->length();
+
+            if (start < last) continue;
+            if (start >= 2 && text.substr(start - 2, 2) == "[[") continue;
+            if (start + len + 2 <= text.size() && text.substr(start + len, 2) == "]]") continue;
+
+            string decoded;
+            if (!b64_decode(cand, decoded)) continue;
+            if (!is_printable_utf8(decoded)) continue;
+            if (!contains_secret(decoded)) continue;
+
+            out.append(text, last, start - last);
+            out.append(save(cand, "ENCODED"));
             last = start + len;
         }
         out.append(text, last, string::npos);
@@ -1549,6 +1748,7 @@ static int usage()
             "  --map FILE          mapping file (default .prosze-map)\n"
             "  --ephemeral         keep mapping in memory only, never write to disk\n"
             "  --passphrase KEY    encrypt mapping file with KEY (or PROSZE_KEY env)\n"
+            "  --strict-restore    only restore placeholders redacted during this session\n"
             "  --names LEVEL       automatic name finder: off | strict | normal (default) | aggressive\n"
             "  --explain           print what was hidden (placeholder = real value) to stderr\n";
     return 2;
@@ -1604,7 +1804,7 @@ int main(int argc, char** argv)
 #endif
     const string mode = selected_mode(argc, argv);
     string map_path = ".prosze-map", names = "normal", passphrase = "";
-    bool explain = false, ephemeral = false;
+    bool explain = false, ephemeral = false, strict_restore = false;
     vector<string> envs, terms, term_files, cmd;
 
     for (int i = 2; i < argc; ++i)
@@ -1619,6 +1819,7 @@ int main(int argc, char** argv)
         else if (a == "--explain") explain = true;
         else if (a == "--ephemeral") ephemeral = true;
         else if (a == "--passphrase") passphrase = next();
+        else if (a == "--strict-restore") strict_restore = true;
         else if (a == "--") { for (++i; i < argc; ++i) cmd.push_back(argv[i]); }
         else return usage();
     }
@@ -1634,6 +1835,7 @@ int main(int argc, char** argv)
     prosze v;
     v.ephemeral = ephemeral;
     v.passphrase = passphrase;
+    v.strict_restore = strict_restore;
     if (!v.load_map(map_path))
     {
         cerr << "prosze: invalid passphrase or corrupted encrypted map\n";
@@ -1674,6 +1876,7 @@ int main(int argc, char** argv)
 
     // run: nothing reaches the command unless it went through the redactor.
     if (cmd.empty()) return usage();
+    v.strict_restore = true;
     vector<string> safe_cmd;
     for (auto& c : cmd) safe_cmd.push_back(v.redact(c));           // args can hold secrets too
     string safe = v.redact(isatty(0) ? string() : slurp_stdin());
