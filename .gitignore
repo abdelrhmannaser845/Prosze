@@ -1,5 +1,9 @@
 # Prosze mapping file (contains real secret values)
 .prosze-map
+plan.md
+.superpowers/sdd/phase-1/
+.tmp-*
+*.zip
 
 # Build outputs
 x64/

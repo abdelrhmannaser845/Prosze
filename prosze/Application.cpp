@@ -24,6 +24,8 @@
 //                                 (./.prosze-terms is loaded automatically)
 //   --env FILE                    also hide every value found in a .env file
 //   --map FILE                    mapping file (default ./.prosze-map)
+//   --ephemeral                   keep mapping in memory only, never write to disk
+//   --passphrase KEY              encrypt mapping file with KEY (or PROSZE_KEY env)
 //   --names LEVEL                 automatic name finder: off | strict | normal (default) | aggressive
 //   --explain                     print what was hidden (placeholder = real value) to stderr
 //
@@ -47,6 +49,8 @@
   #include <windows.h>
   #include <io.h>
   #include <fcntl.h>
+  #include <process.h>
+  #include <sys/stat.h>
   #define popen _popen
   #define pclose _pclose
   #define isatty _isatty
@@ -58,13 +62,16 @@
 #endif
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <random>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -153,8 +160,8 @@ static bool private_ip(const string& s)
 {
     int a, b, c, d;
     if (sscanf(s.c_str(), "%d.%d.%d.%d", &a, &b, &c, &d) != 4) return false;
-    if (a > 255 || b > 255 || c > 255 || d > 255) return false;
-    return a == 10 || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31);
+    if (a < 0 || b < 0 || c < 0 || d < 0 || a > 255 || b > 255 || c > 255 || d > 255) return false;
+    return a == 10 || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31) || (a == 169 && b == 254);
 }
 
 static bool phone_labeled_ok(const string& s) { int n = count_digits(s); return n >= 6 && n <= 15; }
@@ -166,6 +173,108 @@ static bool phone_sep_ok(const string& s)
     static const regex date(R"(^\d{4}-\d{1,2}-\d{1,2})");
     int n = count_digits(s);
     return n >= 9 && n <= 15 && !regex_search(s, date);
+}
+
+// ------------------------------------------------ Base64 & UTF-8 validators
+static bool is_valid_utf8(const string& s)
+{
+    size_t i = 0;
+    while (i < s.size())
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c <= 0x7F)
+        {
+            ++i;
+        }
+        else if ((c & 0xE0) == 0xC0)
+        {
+            if (c < 0xC2 || i + 1 >= s.size() || ((unsigned char)s[i + 1] & 0xC0) != 0x80) return false;
+            i += 2;
+        }
+        else if ((c & 0xF0) == 0xE0)
+        {
+            if (i + 2 >= s.size() || ((unsigned char)s[i + 1] & 0xC0) != 0x80 || ((unsigned char)s[i + 2] & 0xC0) != 0x80) return false;
+            if (c == 0xE0 && (unsigned char)s[i + 1] < 0xA0) return false;
+            if (c == 0xED && (unsigned char)s[i + 1] >= 0xA0) return false;
+            i += 3;
+        }
+        else if ((c & 0xF8) == 0xF0)
+        {
+            if (i + 3 >= s.size() || ((unsigned char)s[i + 1] & 0xC0) != 0x80 || ((unsigned char)s[i + 2] & 0xC0) != 0x80 || ((unsigned char)s[i + 3] & 0xC0) != 0x80) return false;
+            if (c == 0xF0 && (unsigned char)s[i + 1] < 0x90) return false;
+            if (c == 0xF4 && (unsigned char)s[i + 1] > 0x8F) return false;
+            if (c > 0xF4) return false;
+            i += 4;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_printable_utf8(const string& s)
+{
+    if (s.empty()) return false;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\t' || c == '\r' || c == '\n') continue;
+        if (c < 0x20 || c == 0x7F) return false;
+    }
+    return is_valid_utf8(s);
+}
+
+static bool b64_decode(const string& input, string& out)
+{
+    out.clear();
+    if (input.empty()) return false;
+    size_t rem = input.size() % 4;
+    if (rem == 1) return false;
+    string padded = input;
+    if (rem == 2) padded.append("==");
+    else if (rem == 3) padded.append("=");
+
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        if (c == '=') return -2;
+        return -1;
+    };
+
+    out.reserve((padded.size() / 4) * 3);
+    for (size_t i = 0; i < padded.size(); i += 4)
+    {
+        int b0 = val(padded[i]);
+        int b1 = val(padded[i + 1]);
+        int b2 = val(padded[i + 2]);
+        int b3 = val(padded[i + 3]);
+
+        if (b0 < 0 || b1 < 0) return false;
+        if (b2 == -2)
+        {
+            if (b3 != -2 || i + 4 != padded.size()) return false;
+            out.push_back((char)((b0 << 2) | (b1 >> 4)));
+        }
+        else if (b3 == -2)
+        {
+            if (b2 < 0 || i + 4 != padded.size()) return false;
+            out.push_back((char)((b0 << 2) | (b1 >> 4)));
+            out.push_back((char)(((b1 & 0xF) << 4) | (b2 >> 2)));
+        }
+        else
+        {
+            if (b2 < 0 || b3 < 0) return false;
+            out.push_back((char)((b0 << 2) | (b1 >> 4)));
+            out.push_back((char)(((b1 & 0xF) << 4) | (b2 >> 2)));
+            out.push_back((char)(((b2 & 0x3) << 6) | b3));
+        }
+    }
+    return true;
 }
 
 // ------------------------------------------------------- mapping file escapes
@@ -196,6 +305,314 @@ static string unesc(const string& s)
         else o += s[i];
     }
     return o;
+}
+
+// ------------------------------------------------ authenticated encryption (SHA256 & HMAC)
+static const uint32_t SHA256_K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+static inline uint32_t sha_rotr(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+static inline uint32_t sha_ch(uint32_t x, uint32_t y, uint32_t z) {
+    return (x & y) ^ (~x & z);
+}
+
+static inline uint32_t sha_maj(uint32_t x, uint32_t y, uint32_t z) {
+    return (x & y) ^ (x & z) ^ (y & z);
+}
+
+static inline uint32_t sha_sigma0(uint32_t x) {
+    return sha_rotr(x, 2) ^ sha_rotr(x, 13) ^ sha_rotr(x, 22);
+}
+
+static inline uint32_t sha_sigma1(uint32_t x) {
+    return sha_rotr(x, 6) ^ sha_rotr(x, 11) ^ sha_rotr(x, 25);
+}
+
+static inline uint32_t sha_gamma0(uint32_t x) {
+    return sha_rotr(x, 7) ^ sha_rotr(x, 18) ^ (x >> 3);
+}
+
+static inline uint32_t sha_gamma1(uint32_t x) {
+    return sha_rotr(x, 17) ^ sha_rotr(x, 19) ^ (x >> 10);
+}
+
+struct SHA256Context {
+    uint32_t state[8];
+    uint64_t count;
+    uint8_t buffer[64];
+};
+
+static void sha256_transform(uint32_t state[8], const uint8_t block[64]) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i) {
+        w[i] = ((uint32_t)block[i * 4] << 24) |
+               ((uint32_t)block[i * 4 + 1] << 16) |
+               ((uint32_t)block[i * 4 + 2] << 8) |
+               ((uint32_t)block[i * 4 + 3]);
+    }
+    for (int i = 16; i < 64; ++i) {
+        w[i] = sha_gamma1(w[i - 2]) + w[i - 7] + sha_gamma0(w[i - 15]) + w[i - 16];
+    }
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+
+    for (int i = 0; i < 64; ++i) {
+        uint32_t t1 = h + sha_sigma1(e) + sha_ch(e, f, g) + SHA256_K[i] + w[i];
+        uint32_t t2 = sha_sigma0(a) + sha_maj(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+}
+
+static void sha256_init(SHA256Context* ctx) {
+    ctx->state[0] = 0x6a09e667;
+    ctx->state[1] = 0xbb67ae85;
+    ctx->state[2] = 0x3c6ef372;
+    ctx->state[3] = 0xa54ff53a;
+    ctx->state[4] = 0x510e527f;
+    ctx->state[5] = 0x9b05688c;
+    ctx->state[6] = 0x1f83d9ab;
+    ctx->state[7] = 0x5be0cd19;
+    ctx->count = 0;
+}
+
+static void sha256_update(SHA256Context* ctx, const uint8_t* data, size_t len) {
+    size_t buf_idx = (size_t)(ctx->count % 64);
+    ctx->count += len;
+    size_t i = 0;
+    if (buf_idx > 0) {
+        size_t fill = 64 - buf_idx;
+        if (len < fill) {
+            memcpy(ctx->buffer + buf_idx, data, len);
+            return;
+        }
+        memcpy(ctx->buffer + buf_idx, data, fill);
+        sha256_transform(ctx->state, ctx->buffer);
+        i += fill;
+    }
+    for (; i + 64 <= len; i += 64) {
+        sha256_transform(ctx->state, data + i);
+    }
+    if (i < len) {
+        memcpy(ctx->buffer, data + i, len - i);
+    }
+}
+
+static void sha256_final(SHA256Context* ctx, uint8_t digest[32]) {
+    uint64_t total_bits = ctx->count * 8;
+    size_t buf_idx = (size_t)(ctx->count % 64);
+    ctx->buffer[buf_idx++] = 0x80;
+    if (buf_idx > 56) {
+        memset(ctx->buffer + buf_idx, 0, 64 - buf_idx);
+        sha256_transform(ctx->state, ctx->buffer);
+        buf_idx = 0;
+    }
+    memset(ctx->buffer + buf_idx, 0, 56 - buf_idx);
+    for (int i = 7; i >= 0; --i) {
+        ctx->buffer[56 + (7 - i)] = (uint8_t)((total_bits >> (i * 8)) & 0xFF);
+    }
+    sha256_transform(ctx->state, ctx->buffer);
+    for (int i = 0; i < 8; ++i) {
+        digest[i * 4] = (uint8_t)((ctx->state[i] >> 24) & 0xFF);
+        digest[i * 4 + 1] = (uint8_t)((ctx->state[i] >> 16) & 0xFF);
+        digest[i * 4 + 2] = (uint8_t)((ctx->state[i] >> 8) & 0xFF);
+        digest[i * 4 + 3] = (uint8_t)(ctx->state[i] & 0xFF);
+    }
+}
+
+static void sha256_bytes(const uint8_t* data, size_t len, uint8_t digest[32]) {
+    SHA256Context ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, data, len);
+    sha256_final(&ctx, digest);
+}
+
+static void hmac_sha256_raw(const uint8_t* key, size_t key_len,
+                            const uint8_t* data, size_t data_len,
+                            uint8_t out[32]) {
+    uint8_t k_pad[64];
+    memset(k_pad, 0, sizeof(k_pad));
+    if (key_len > 64) {
+        sha256_bytes(key, key_len, k_pad);
+    } else {
+        memcpy(k_pad, key, key_len);
+    }
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; ++i) {
+        ipad[i] = k_pad[i] ^ 0x36;
+        opad[i] = k_pad[i] ^ 0x5c;
+    }
+    uint8_t inner[32];
+    SHA256Context ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, ipad, 64);
+    sha256_update(&ctx, data, data_len);
+    sha256_final(&ctx, inner);
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, opad, 64);
+    sha256_update(&ctx, inner, 32);
+    sha256_final(&ctx, out);
+}
+
+static string to_hex(const uint8_t* data, size_t len) {
+    static const char hex_chars[] = "0123456789abcdef";
+    string s;
+    s.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        s.push_back(hex_chars[(data[i] >> 4) & 0x0F]);
+        s.push_back(hex_chars[data[i] & 0x0F]);
+    }
+    return s;
+}
+
+static bool from_hex(const string& hex, vector<uint8_t>& out) {
+    if (hex.size() % 2 != 0) return false;
+    out.clear();
+    out.reserve(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        int hi = -1, lo = -1;
+        char c1 = hex[i], c2 = hex[i + 1];
+        if (c1 >= '0' && c1 <= '9') hi = c1 - '0';
+        else if (c1 >= 'a' && c1 <= 'f') hi = c1 - 'a' + 10;
+        else if (c1 >= 'A' && c1 <= 'F') hi = c1 - 'A' + 10;
+        else return false;
+
+        if (c2 >= '0' && c2 <= '9') lo = c2 - '0';
+        else if (c2 >= 'a' && c2 <= 'f') lo = c2 - 'a' + 10;
+        else if (c2 >= 'A' && c2 <= 'F') lo = c2 - 'A' + 10;
+        else return false;
+
+        out.push_back((uint8_t)((hi << 4) | lo));
+    }
+    return true;
+}
+
+static vector<uint8_t> hmac_sha256_str(const string& key, const string& data) {
+    vector<uint8_t> out(32);
+    hmac_sha256_raw((const uint8_t*)key.data(), key.size(),
+                    (const uint8_t*)data.data(), data.size(),
+                    out.data());
+    return out;
+}
+
+static vector<uint8_t> crypt_keystream(const vector<uint8_t>& k_enc, const uint8_t* in, size_t len) {
+    vector<uint8_t> out(len);
+    uint8_t block[32];
+    uint8_t counter[4];
+    for (size_t i = 0; i < len; ++i) {
+        size_t block_off = i % 32;
+        if (block_off == 0) {
+            uint32_t blk = (uint32_t)(i / 32);
+            counter[0] = (uint8_t)((blk >> 24) & 0xFF);
+            counter[1] = (uint8_t)((blk >> 16) & 0xFF);
+            counter[2] = (uint8_t)((blk >> 8) & 0xFF);
+            counter[3] = (uint8_t)(blk & 0xFF);
+            hmac_sha256_raw(k_enc.data(), k_enc.size(), counter, 4, block);
+        }
+        out[i] = in[i] ^ block[block_off];
+    }
+    return out;
+}
+
+static bool constant_time_eq(const string& a, const string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff |= ((unsigned char)a[i] ^ (unsigned char)b[i]);
+    }
+    return diff == 0;
+}
+
+static vector<uint8_t> generate_nonce_16() {
+    vector<uint8_t> nonce(16);
+    std::random_device rd;
+    for (size_t i = 0; i < 16; ++i) {
+        nonce[i] = (uint8_t)(rd() & 0xFF);
+    }
+    return nonce;
+}
+
+static string encrypt_vault(const string& passphrase, const string& plaintext) {
+    vector<uint8_t> nonce = generate_nonce_16();
+    string nonce_hex = to_hex(nonce.data(), nonce.size());
+
+    vector<uint8_t> k_enc = hmac_sha256_str(passphrase, "prosze-enc-v1:" + nonce_hex);
+    vector<uint8_t> k_mac = hmac_sha256_str(passphrase, "prosze-mac-v1:" + nonce_hex);
+
+    vector<uint8_t> cipher_bytes = crypt_keystream(k_enc, (const uint8_t*)plaintext.data(), plaintext.size());
+    string cipher_hex = to_hex(cipher_bytes.data(), cipher_bytes.size());
+
+    string mac_data = nonce_hex + "\t" + cipher_hex;
+    vector<uint8_t> tag_bytes(32);
+    hmac_sha256_raw(k_mac.data(), k_mac.size(), (const uint8_t*)mac_data.data(), mac_data.size(), tag_bytes.data());
+    string tag_hex = to_hex(tag_bytes.data(), tag_bytes.size());
+
+    return "#PROSZE_ENC_V1\t" + nonce_hex + "\t" + cipher_hex + "\t" + tag_hex + "\n";
+}
+
+static bool decrypt_vault(const string& passphrase, const string& enc_line, string& out_plaintext) {
+    if (passphrase.empty()) return false;
+    vector<string> parts;
+    size_t start = 0;
+    while (true) {
+        size_t tab = enc_line.find('\t', start);
+        if (tab == string::npos) {
+            parts.push_back(enc_line.substr(start));
+            break;
+        }
+        parts.push_back(enc_line.substr(start, tab - start));
+        start = tab + 1;
+    }
+    if (parts.size() != 4 || parts[0] != "#PROSZE_ENC_V1") return false;
+    const string& nonce_hex = parts[1];
+    const string& cipher_hex = parts[2];
+    string tag_hex = parts[3];
+    while (!tag_hex.empty() && (tag_hex.back() == '\r' || tag_hex.back() == '\n')) tag_hex.pop_back();
+
+    if (nonce_hex.size() != 32 || tag_hex.size() != 64) return false;
+
+    vector<uint8_t> k_enc = hmac_sha256_str(passphrase, "prosze-enc-v1:" + nonce_hex);
+    vector<uint8_t> k_mac = hmac_sha256_str(passphrase, "prosze-mac-v1:" + nonce_hex);
+
+    string mac_data = nonce_hex + "\t" + cipher_hex;
+    vector<uint8_t> expected_tag_bytes(32);
+    hmac_sha256_raw(k_mac.data(), k_mac.size(), (const uint8_t*)mac_data.data(), mac_data.size(), expected_tag_bytes.data());
+    string expected_tag_hex = to_hex(expected_tag_bytes.data(), expected_tag_bytes.size());
+
+    if (!constant_time_eq(lower(tag_hex), lower(expected_tag_hex))) return false;
+
+    vector<uint8_t> cipher_bytes;
+    if (!from_hex(cipher_hex, cipher_bytes)) return false;
+
+    vector<uint8_t> plain_bytes = crypt_keystream(k_enc, cipher_bytes.data(), cipher_bytes.size());
+    out_plaintext.assign((const char*)plain_bytes.data(), plain_bytes.size());
+    return true;
 }
 
 // ------------------------------------------------------- automatic name finder
@@ -534,10 +951,67 @@ class prosze
     vector<Term> terms;                      // names, longest first
     map<string, string> name_fold;           // lowercase name -> placeholder (any name category)
 public:
+    string passphrase;
+    bool ephemeral = false;
+    bool strict_restore = false;
+    set<string> session_keys;
     vector<pair<string, string>> fresh;      // placeholders created by the last redact()
     int name_level = 2;                      // 0 off, 1 strict, 2 normal, 3 aggressive
     size_t hits = 0;
     bool dirty = false;
+
+    ~prosze()
+    {
+        auto zero_str = [](string& s) {
+            volatile char* p = const_cast<volatile char*>(s.data());
+            for (size_t i = 0; i < s.size(); ++i) p[i] = 0;
+        };
+        for (auto& [k, v] : forward) {
+            zero_str(const_cast<string&>(k));
+            zero_str(v);
+        }
+        forward.clear();
+
+        for (auto& [k, v] : backward) {
+            zero_str(const_cast<string&>(k));
+            zero_str(v);
+        }
+        backward.clear();
+
+        for (auto& [lit, cat] : literals) {
+            zero_str(lit);
+            zero_str(cat);
+        }
+        literals.clear();
+
+        for (auto& [k, v] : fresh) {
+            zero_str(k);
+            zero_str(v);
+        }
+        fresh.clear();
+
+        for (auto& [k, v] : fold) {
+            zero_str(const_cast<string&>(k));
+            zero_str(v);
+        }
+        fold.clear();
+
+        for (auto& [k, v] : name_fold) {
+            zero_str(const_cast<string&>(k));
+            zero_str(v);
+        }
+        name_fold.clear();
+
+        for (auto& t : terms) {
+            zero_str(t.cat);
+            zero_str(t.low);
+        }
+        terms.clear();
+
+        zero_str(passphrase);
+        passphrase.clear();
+        session_keys.clear();
+    }
 
     prosze()
     {
@@ -549,6 +1023,9 @@ public:
 
         add("TOKEN", R"RX(\b(?:AKIA|ASIA)[A-Z0-9]{16}\b)RX");
         add("TOKEN", R"RX(\bAIza[0-9A-Za-z_\-]{35}\b)RX");
+        add("TOKEN", R"RX(\bhf_[A-Za-z0-9]{30,}\b)RX");
+        add("TOKEN", R"RX(\bgithub_pat_[A-Za-z0-9_]{20,}\b)RX");
+        add("TOKEN", R"RX(https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+)RX");
         add("TOKEN", R"RX(\b(?:sk|pk|rk|ghp|gho|ghs|ghu|glpat|xox[baprs])[-_][A-Za-z0-9_\-]{12,}\b)RX");
         add("TOKEN", R"RX(\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b)RX");
         add("TOKEN", R"RX(\bBearer\s+([A-Za-z0-9_\-\.=]{16,}))RX", 1, not_placeholder);
@@ -572,6 +1049,7 @@ public:
         add("APIKEY", R"RX(\b[A-Za-z0-9]{32}\b)RX", 0, looks_random);
         add("APIKEY", R"RX(\b[A-Fa-f0-9]{40,64}\b)RX");
         add("IP", R"RX(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)RX", 0, private_ip);
+        add("IP", R"RX(\b(?:f[cd][0-9a-f]{2}|fe80):(?:[0-9a-f:]*:[0-9a-f]+|:)(?!:))RX", 0, nullptr, true);
 
         // std::regex has no look-behind: the leading boundary is captured in
         // group 1 and only group 2 (the number) is replaced.
@@ -656,14 +1134,20 @@ public:
     {
         ++hits;
         auto it = backward.find(value);
-        if (it != backward.end()) return it->second;
+        if (it != backward.end()) {
+            session_keys.insert(it->second);
+            return it->second;
+        }
 
         bool is_term = term_cats.count(cat) > 0;
         string fk = cat + '\x01' + lower(value);
         if (is_term)
         {
             auto f = fold.find(fk);
-            if (f != fold.end()) return f->second;   // same name, other capitalisation
+            if (f != fold.end()) {
+                session_keys.insert(f->second);
+                return f->second;   // same name, other capitalisation
+            }
         }
         string key = "[[" + cat + "_" + to_string(++counters[cat]) + "]]";
         backward[value] = key;
@@ -671,6 +1155,7 @@ public:
         if (is_term) fold[fk] = key;
         dirty = true;
         fresh.push_back({ key, value });
+        session_keys.insert(key);
         return key;
     }
 
@@ -680,6 +1165,7 @@ public:
         string t = replace_literals(input);
         t = replace_key_blocks(t);
         for (const Rule& r : rules) t = apply(t, r);
+        t = replace_base64_secrets(t);
         for (const Term& term : terms) t = replace_term(t, term);   // listed + learned names
         return auto_names(t);                                       // names nobody listed
     }
@@ -723,7 +1209,9 @@ public:
         for (auto it = sregex_iterator(input.begin(), input.end(), ph);
              it != sregex_iterator(); ++it)
         {
-            auto f = forward.find(it->str());
+            string key = it->str();
+            if (strict_restore && session_keys.count(key) == 0) continue;
+            auto f = forward.find(key);
             if (f == forward.end()) continue;
             out.append(input, last, it->position(0) - last);
             out.append(f->second);
@@ -735,37 +1223,111 @@ public:
 
     bool save_map(const string& path) const
     {
-        { ofstream touch(path, ios::app); if (!touch) return false; }
-#ifndef _WIN32
-        chmod(path.c_str(), 0600);        // private before any secret is written
+        if (ephemeral) return true;
+
+        string tmp = path + ".tmp." + to_string(
+#ifdef _WIN32
+            GetCurrentProcessId()
+#else
+            getpid()
 #endif
-        ofstream out(path, ios::trunc);
-        if (!out) return false;
-        for (auto& [k, v] : forward) out << k << '\t' << esc(v) << '\n';
+        );
+
+        {
+            ofstream touch(tmp, ios::app | ios::binary);
+            if (!touch) return false;
+        }
+#ifdef _WIN32
+        _chmod(tmp.c_str(), _S_IREAD | _S_IWRITE);
+#else
+        chmod(tmp.c_str(), 0600);
+#endif
+
+        ofstream out(tmp, ios::trunc | ios::binary);
+        if (!out) {
+            ::remove(tmp.c_str());
+            return false;
+        }
+
+        if (!passphrase.empty()) {
+            ostringstream tsv;
+            for (auto& [k, v] : forward) tsv << k << '\t' << esc(v) << '\n';
+            string enc = encrypt_vault(passphrase, tsv.str());
+            out << enc;
+        } else {
+            for (auto& [k, v] : forward) out << k << '\t' << esc(v) << '\n';
+        }
+
+        out.flush();
+        if (!out) {
+            out.close();
+            ::remove(tmp.c_str());
+            return false;
+        }
+        out.close();
+
+#ifdef _WIN32
+        if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            ::remove(tmp.c_str());
+            return false;
+        }
+#else
+        if (rename(tmp.c_str(), path.c_str()) != 0) {
+            ::remove(tmp.c_str());
+            return false;
+        }
+#endif
         return true;
     }
 
-    void load_map(const string& path)
+    void parse_map_line(const string& line)
     {
-        ifstream in(path);
-        string line;
-        while (getline(in, line))
+        size_t tab = line.find('\t');
+        if (tab == string::npos) return;
+        string k = line.substr(0, tab), v = unesc(line.substr(tab + 1));
+        forward[k] = v; backward[v] = k;
+        if (k.size() > 5 && k.rfind("[[", 0) == 0)          // [[CAT_N]]
         {
-            size_t tab = line.find('\t');
-            if (tab == string::npos) continue;
-            string k = line.substr(0, tab), v = unesc(line.substr(tab + 1));
-            forward[k] = v; backward[v] = k;
-            if (k.size() > 5 && k.rfind("[[", 0) == 0)          // [[CAT_N]]
+            string inner = k.substr(2, k.size() - 4);
+            size_t us = inner.rfind('_');
+            if (us != string::npos)
             {
-                string inner = k.substr(2, k.size() - 4);
-                size_t us = inner.rfind('_');
-                if (us != string::npos)
-                {
-                    int n = atoi(inner.c_str() + us + 1);
-                    int& c = counters[inner.substr(0, us)];
-                    c = max(c, n);
-                }
+                int n = atoi(inner.c_str() + us + 1);
+                int& c = counters[inner.substr(0, us)];
+                c = max(c, n);
             }
+        }
+    }
+
+    bool load_map(const string& path)
+    {
+        ifstream in(path, ios::binary);
+        if (!in) return true;
+
+        string first_line;
+        if (!getline(in, first_line)) return true;
+        if (!first_line.empty() && first_line.back() == '\r') first_line.pop_back();
+
+        static const string MAGIC = "#PROSZE_ENC_V1\t";
+        if (first_line.rfind(MAGIC, 0) == 0) {
+            if (passphrase.empty()) return false;
+            string decrypted_tsv;
+            if (!decrypt_vault(passphrase, first_line, decrypted_tsv)) return false;
+            istringstream iss(decrypted_tsv);
+            string line;
+            while (getline(iss, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                parse_map_line(line);
+            }
+            return true;
+        } else {
+            parse_map_line(first_line);
+            string line;
+            while (getline(in, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                parse_map_line(line);
+            }
+            return true;
         }
     }
 
@@ -810,7 +1372,11 @@ private:
     {
         string lk = lower(value);
         auto it = name_fold.find(lk);
-        if (it != name_fold.end()) { ++hits; return it->second; }
+        if (it != name_fold.end()) {
+            ++hits;
+            session_keys.insert(it->second);
+            return it->second;
+        }
         string key = save(value, cat);
         name_fold[lk] = key;
         return key;
@@ -923,6 +1489,82 @@ private:
             if (r.validate && !r.validate(value)) continue;
             out.append(text, last, start - last);
             out.append(save(value, r.cat));
+            last = start + len;
+        }
+        out.append(text, last, string::npos);
+        return out;
+    }
+
+    bool contains_secret(const string& decoded) const
+    {
+        for (const auto& [lit, cat] : literals)
+        {
+            if (decoded.find(lit) != string::npos) return true;
+        }
+        size_t b = decoded.find("-----BEGIN ");
+        if (b != string::npos)
+        {
+            size_t he = decoded.find("-----", b + 11);
+            if (he != string::npos)
+            {
+                string label = decoded.substr(b + 11, he - b - 11);
+                if (label.find("PRIVATE KEY") != string::npos)
+                    return true;
+            }
+        }
+        for (const Rule& r : rules)
+        {
+            for (auto it = sregex_iterator(decoded.begin(), decoded.end(), r.rx);
+                 it != sregex_iterator(); ++it)
+            {
+                const smatch& m = *it;
+                if (r.group < m.size() && m[r.group].matched)
+                {
+                    string val = m.str(r.group);
+                    if (!val.empty() && (!r.validate || r.validate(val)))
+                        return true;
+                }
+            }
+        }
+        for (const Term& term : terms)
+        {
+            const string low = lower(decoded);
+            const string& t = term.low;
+            size_t pos = 0;
+            while ((pos = low.find(t, pos)) != string::npos)
+            {
+                size_t end = pos + t.size();
+                bool lb = !word_char((unsigned char)t.front()) || pos == 0 || !word_char((unsigned char)decoded[pos - 1]);
+                bool rb = !word_char((unsigned char)t.back()) || end == decoded.size() || !word_char((unsigned char)decoded[end]);
+                if (lb && rb) return true;
+                ++pos;
+            }
+        }
+        return false;
+    }
+
+    string replace_base64_secrets(const string& text)
+    {
+        static const regex b64_cand(R"RX(\b[A-Za-z0-9+/]{24,}(?:={1,2}(?![A-Za-z0-9+/=])|\b))RX");
+        string out; size_t last = 0;
+        for (auto it = sregex_iterator(text.begin(), text.end(), b64_cand);
+             it != sregex_iterator(); ++it)
+        {
+            string cand = it->str();
+            size_t start = (size_t)it->position();
+            size_t len = (size_t)it->length();
+
+            if (start < last) continue;
+            if (start >= 2 && text.substr(start - 2, 2) == "[[") continue;
+            if (start + len + 2 <= text.size() && text.substr(start + len, 2) == "]]") continue;
+
+            string decoded;
+            if (!b64_decode(cand, decoded)) continue;
+            if (!is_printable_utf8(decoded)) continue;
+            if (!contains_secret(decoded)) continue;
+
+            out.append(text, last, start - last);
+            out.append(save(cand, "ENCODED"));
             last = start + len;
         }
         out.append(text, last, string::npos);
@@ -1104,6 +1746,9 @@ static int usage()
             "  --terms FILE        names, one per line (./.prosze-terms is loaded automatically)\n"
             "  --env FILE          hide every value of a .env file\n"
             "  --map FILE          mapping file (default .prosze-map)\n"
+            "  --ephemeral         keep mapping in memory only, never write to disk\n"
+            "  --passphrase KEY    encrypt mapping file with KEY (or PROSZE_KEY env)\n"
+            "  --strict-restore    only restore placeholders redacted during this session\n"
             "  --names LEVEL       automatic name finder: off | strict | normal (default) | aggressive\n"
             "  --explain           print what was hidden (placeholder = real value) to stderr\n";
     return 2;
@@ -1158,8 +1803,8 @@ int main(int argc, char** argv)
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
     const string mode = selected_mode(argc, argv);
-    string map_path = ".prosze-map", names = "normal";
-    bool explain = false;
+    string map_path = ".prosze-map", names = "normal", passphrase = "";
+    bool explain = false, ephemeral = false, strict_restore = false;
     vector<string> envs, terms, term_files, cmd;
 
     for (int i = 2; i < argc; ++i)
@@ -1172,14 +1817,30 @@ int main(int argc, char** argv)
         else if (a == "--terms") term_files.push_back(next());
         else if (a == "--names") names = next();
         else if (a == "--explain") explain = true;
-        else if (a == "--\") { for (++i; i < argc; ++i) cmd.push_back(argv[i]); }
+        else if (a == "--ephemeral") ephemeral = true;
+        else if (a == "--passphrase") passphrase = next();
+        else if (a == "--strict-restore") strict_restore = true;
+        else if (a == "--") { for (++i; i < argc; ++i) cmd.push_back(argv[i]); }
         else return usage();
     }
     if (mode != "chat" && mode != "redact" && mode != "restore" && mode != "check" && mode != "run")
         return usage();
 
+    if (passphrase.empty())
+    {
+        const char* env_key = getenv("PROSZE_KEY");
+        if (env_key && env_key[0] != '\0') passphrase = env_key;
+    }
+
     prosze v;
-    v.load_map(map_path);
+    v.ephemeral = ephemeral;
+    v.passphrase = passphrase;
+    v.strict_restore = strict_restore;
+    if (!v.load_map(map_path))
+    {
+        cerr << "prosze: invalid passphrase or corrupted encrypted map\n";
+        return 1;
+    }
     if (!v.set_level(names)) { cerr << "prosze: --names must be off, strict, normal or aggressive\n"; return 2; }
     v.learn_from_map();
     for (auto& e : envs)
@@ -1215,6 +1876,7 @@ int main(int argc, char** argv)
 
     // run: nothing reaches the command unless it went through the redactor.
     if (cmd.empty()) return usage();
+    v.strict_restore = true;
     vector<string> safe_cmd;
     for (auto& c : cmd) safe_cmd.push_back(v.redact(c));           // args can hold secrets too
     string safe = v.redact(isatty(0) ? string() : slurp_stdin());
