@@ -29,11 +29,19 @@ def build_common_parser() -> argparse.ArgumentParser:
     p.add_argument("--term", action="append", default=[])
     p.add_argument("--terms", action="append", default=[])
     p.add_argument("--no-ner", action="store_true", help="disable GLiNER name detection")
+    p.add_argument("--ephemeral", action="store_true", help="keep mapping in memory only, never write to disk")
+    p.add_argument("--passphrase", default=None, metavar="KEY", help="encrypt mapping file with KEY (or PROSZE_KEY env)")
     return p
 
 
 def build_vault(args: argparse.Namespace) -> Vault:
-    v = Vault(getattr(args, "map", ".prosze-map"))
+    ephemeral = getattr(args, "ephemeral", False)
+    passphrase = getattr(args, "passphrase", None)
+    if passphrase is None:
+        env_key = os.environ.get("PROSZE_KEY")
+        if env_key:
+            passphrase = env_key
+    v = Vault(getattr(args, "map", ".prosze-map"), ephemeral=ephemeral, passphrase=passphrase)
     if getattr(args, "no_ner", False):
         v._ner_attempted = True
     for p in getattr(args, "env", []):
@@ -120,7 +128,11 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
     if not a.cmd:
         ap.print_help()
         return
-    v = build_vault(a)
+    try:
+        v = build_vault(a)
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        sys.exit(1)
 
     if a.cmd == "chat":
         cmd_chat(v)

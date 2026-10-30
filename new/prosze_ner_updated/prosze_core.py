@@ -7,11 +7,14 @@ This module contains all core functionality that is NOT the proxy or plugin:
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
 import sys
 import threading
+from typing import Optional, Tuple
 
 
 # ------------------------------------------------------------------ validators
@@ -111,9 +114,72 @@ PH = re.compile(r"\[\[[A-Z][A-Z0-9_]*_\d+\]\]")
 PH_IDX = re.compile(r"^\[\[([A-Z][A-Z0-9_]*)_(\d+)\]\]$")
 
 
+# ---------------------------------------------------------------- authenticated encryption
+def _derive_keys(passphrase: str, nonce_hex: str) -> Tuple[bytes, bytes]:
+    pw_bytes = passphrase.encode("utf-8")
+    k_enc = hmac.new(pw_bytes, f"prosze-enc-v1:{nonce_hex}".encode("utf-8"), hashlib.sha256).digest()
+    k_mac = hmac.new(pw_bytes, f"prosze-mac-v1:{nonce_hex}".encode("utf-8"), hashlib.sha256).digest()
+    return k_enc, k_mac
+
+
+def _crypt_keystream(k_enc: bytes, data: bytes) -> bytes:
+    out = bytearray(len(data))
+    block = b""
+    for i in range(len(data)):
+        if i % 32 == 0:
+            counter = (i // 32).to_bytes(4, "big")
+            block = hmac.new(k_enc, counter, hashlib.sha256).digest()
+        out[i] = data[i] ^ block[i % 32]
+    return bytes(out)
+
+
+def encrypt_map(passphrase: str, plaintext: str) -> str:
+    nonce = os.urandom(16)
+    nonce_hex = nonce.hex().lower()
+    k_enc, k_mac = _derive_keys(passphrase, nonce_hex)
+    p_bytes = plaintext.encode("utf-8")
+    c_bytes = _crypt_keystream(k_enc, p_bytes)
+    cipher_hex = c_bytes.hex().lower()
+    mac_data = f"{nonce_hex}\t{cipher_hex}".encode("utf-8")
+    tag_hex = hmac.new(k_mac, mac_data, hashlib.sha256).hexdigest().lower()
+    return f"#PROSZE_ENC_V1\t{nonce_hex}\t{cipher_hex}\t{tag_hex}\n"
+
+
+def decrypt_map(passphrase: Optional[str], line: str) -> str:
+    if not passphrase:
+        raise ValueError("prosze: invalid passphrase or corrupted encrypted map")
+    stripped = line.rstrip("\r\n")
+    parts = stripped.split("\t")
+    if len(parts) != 4 or parts[0] != "#PROSZE_ENC_V1":
+        raise ValueError("prosze: invalid passphrase or corrupted encrypted map")
+    nonce_hex, cipher_hex, tag_hex = parts[1], parts[2], parts[3]
+    if len(nonce_hex) != 32 or len(tag_hex) != 64:
+        raise ValueError("prosze: invalid passphrase or corrupted encrypted map")
+    k_enc, k_mac = _derive_keys(passphrase, nonce_hex)
+    mac_data = f"{nonce_hex}\t{cipher_hex}".encode("utf-8")
+    expected_tag = hmac.new(k_mac, mac_data, hashlib.sha256).hexdigest().lower()
+    if not hmac.compare_digest(tag_hex.lower(), expected_tag):
+        raise ValueError("prosze: invalid passphrase or corrupted encrypted map")
+    try:
+        c_bytes = bytes.fromhex(cipher_hex)
+    except ValueError:
+        raise ValueError("prosze: invalid passphrase or corrupted encrypted map")
+    p_bytes = _crypt_keystream(k_enc, c_bytes)
+    try:
+        return p_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("prosze: invalid passphrase or corrupted encrypted map")
+
+
 class Vault:
-    def __init__(self, map_path):
+    def __init__(self, map_path: str, ephemeral: bool = False, passphrase: Optional[str] = None):
         self.map_path = map_path
+        self.ephemeral = ephemeral
+        if passphrase is None:
+            env_key = os.environ.get("PROSZE_KEY")
+            if env_key:
+                passphrase = env_key
+        self.passphrase = passphrase
         self.fwd, self.bwd, self.counters = {}, {}, {}
         self.rules = [(c, re.compile(p, f), g, v) for c, p, g, v, f in RULES]
         self.literals = []
@@ -268,27 +334,48 @@ class Vault:
 
     # -- map file (same TSV format as the C++ prosze, mode 0600)
     def _persist(self):
-        tmp = self.map_path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            for k, v in self.fwd.items():
-                f.write(f"{k}\t{esc(v)}\n")
-        os.replace(tmp, self.map_path)
+        if self.ephemeral:
+            return
+        tmp = f"{self.map_path}.tmp.{os.getpid()}"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                if self.passphrase:
+                    tsv_lines = "".join(f"{k}\t{esc(v)}\n" for k, v in self.fwd.items())
+                    f.write(encrypt_map(self.passphrase, tsv_lines))
+                else:
+                    for k, v in self.fwd.items():
+                        f.write(f"{k}\t{esc(v)}\n")
+            os.replace(tmp, self.map_path)
+        except Exception:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            raise
 
     def _load(self):
         if not os.path.exists(self.map_path):
             return
-        with open(self.map_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if "\t" not in line:
-                    continue
-                k, v = line.split("\t", 1)
-                v = unesc(v)
-                self.fwd[k], self.bwd[v] = v, k
-                m = PH_IDX.match(k)
-                if m:
-                    self.counters[m[1]] = max(self.counters.get(m[1], 0), int(m[2]))
+        with open(self.map_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+        lines = content.splitlines()
+        first_line = lines[0] if lines else ""
+        if first_line.startswith("#PROSZE_ENC_V1\t"):
+            tsv_content = decrypt_map(self.passphrase, first_line)
+            lines = tsv_content.splitlines()
+
+        for line in lines:
+            if "\t" not in line:
+                continue
+            k, v = line.split("\t", 1)
+            v = unesc(v)
+            self.fwd[k], self.bwd[v] = v, k
+            m = PH_IDX.match(k)
+            if m:
+                self.counters[m[1]] = max(self.counters.get(m[1], 0), int(m[2]))
 
 
 # ----------------------------------------------------------------- JSON walker
