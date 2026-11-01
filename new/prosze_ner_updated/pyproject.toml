@@ -9,9 +9,7 @@ description = "Zero-leak local privacy shield for Hermes Agent and CLI."
 readme = "README-NER.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
-dependencies = [
-    "requests>=2.28.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
 ner = ["gliner>=0.2.0"]
@@ -19,11 +17,8 @@ ner = ["gliner>=0.2.0"]
 [project.scripts]
 prosze = "prosze_cli:main"
 
-[project.entry-points."hermes_agent.plugins"]
-prosze = "prosze_plugin:register"
-
 [tool.setuptools]
-py-modules = ["prosze_proxy", "prosze_plugin", "hermes_connector", "prosze_main"]
+py-modules = ["prosze_core", "prosze_main"]
 
 [tool.setuptools.packages.find]
 include = ["prosze_cli*"]
