@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -109,6 +110,23 @@ class ApplicationTests(unittest.TestCase):
         with patch("prosze_cli.cmd_chat") as launch_chat:
             cli_main([])
         launch_chat.assert_called_once()
+
+    def test_pyproject_metadata_references_existing_modules(self):
+        pyproject_path = PACKAGE_DIR / "pyproject.toml"
+        with open(pyproject_path, "rb") as f:
+            pyproject_data = tomllib.load(f)
+
+        project = pyproject_data.get("project", {})
+        tool_setuptools = pyproject_data.get("tool", {}).get("setuptools", {})
+
+        py_modules = tool_setuptools.get("py-modules", [])
+        self.assertEqual(py_modules, ["prosze_core", "prosze_main"])
+        for module_name in py_modules:
+            module_file = PACKAGE_DIR / f"{module_name}.py"
+            self.assertTrue(module_file.is_file(), f"Module file {module_file} does not exist on disk")
+
+        self.assertNotIn("hermes_agent.plugins", project.get("entry-points", {}))
+        self.assertEqual(project.get("dependencies"), [])
 
 
 if __name__ == "__main__":

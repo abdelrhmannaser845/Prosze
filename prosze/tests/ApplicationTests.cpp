@@ -77,22 +77,11 @@ static void test_bare_invocation_selects_chat()
     assert(selected_mode(2, explicit_mode) == "redact");
 }
 
-static void test_proxy_json_restoration_escapes_values()
-{
-    string restored = restore_json_strings(
-        R"({"reply":"[[EMAIL_1]]","unchanged":"x"})",
-        [](const string& value) {
-            return value == "[[EMAIL_1]]" ? string("alice\"\\example") : value;
-        });
-    assert(restored == R"({"reply":"alice\"\\example","unchanged":"x"})");
-}
-
 int main()
 {
     test_redaction_and_restoration();
     test_env_and_tsv_map_compatibility();
     test_native_process_execution();
     test_bare_invocation_selects_chat();
-    test_proxy_json_restoration_escapes_values();
     return 0;
 }

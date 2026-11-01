@@ -1172,7 +1172,7 @@ int main(int argc, char** argv)
         else if (a == "--terms") term_files.push_back(next());
         else if (a == "--names") names = next();
         else if (a == "--explain") explain = true;
-        else if (a == "--\") { for (++i; i < argc; ++i) cmd.push_back(argv[i]); }
+        else if (a == "--") { for (++i; i < argc; ++i) cmd.push_back(argv[i]); }
         else return usage();
     }
     if (mode != "chat" && mode != "redact" && mode != "restore" && mode != "check" && mode != "run")
