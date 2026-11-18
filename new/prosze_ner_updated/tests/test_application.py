@@ -1307,6 +1307,489 @@ class ApplicationTests(unittest.TestCase):
         self.assertNotEqual(cm.exception.code, 0)
         self.assertIn("refusing non-loopback listen host", bad_err.getvalue())
 
+    def test_mcp_broker_message_transforms(self):
+        from prosze_cli.mcp import MCPBroker
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            v.add_term("CUSTOMER=Acme Corp")
+            v.add_literal('secret "quoted"\nline2', cat="ENV")
+            safe_init, _ = v.redact('Customer Acme Corp, alice@example.com, secret "quoted"\nline2')
+            self.assertEqual(safe_init, "Customer [[CUSTOMER_1]], [[EMAIL_1]], [[ENV_1]]")
+
+            broker = MCPBroker(v)
+
+            # Client requests/notifications with params restore placeholders recursively
+            tools_call = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_email",
+                    "arguments": {
+                        "to": "[[EMAIL_1]]",
+                        "customer": "[[CUSTOMER_1]]",
+                        "secret_note": "[[ENV_1]]",
+                        "id": "[[EMAIL_1]]",  # SKIP_KEYS preserved
+                        "attachment": "data:text/plain;base64,W1tFTUFJTF8xXV0=",
+                    },
+                },
+            }) + "\n"
+            restored_line = broker.process_client_message(tools_call)
+            self.assertTrue(restored_line.endswith("\n"))
+            restored_msg = json.loads(restored_line)
+            args = restored_msg["params"]["arguments"]
+            self.assertEqual(args["to"], "alice@example.com")
+            self.assertEqual(args["customer"], "Acme Corp")
+            self.assertEqual(args["secret_note"], 'secret "quoted"\nline2')
+            self.assertEqual(args["id"], "[[EMAIL_1]]")
+            self.assertEqual(args["attachment"], "data:text/plain;base64,W1tFTUFJTF8xXV0=")
+
+            res_read = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {"uri": "file:///customers/[[CUSTOMER_1]]/info.txt"},
+            })
+            self.assertEqual(
+                json.loads(broker.process_client_message(res_read))["params"]["uri"],
+                "file:///customers/Acme Corp/info.txt",
+            )
+
+            prompt_get = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "prompts/get",
+                "params": {"name": "greet", "arguments": {"recipient": "[[EMAIL_1]]"}},
+            })
+            self.assertEqual(
+                json.loads(broker.process_client_message(prompt_get))["params"]["arguments"]["recipient"],
+                "alice@example.com",
+            )
+
+            # Client request without params passes through safely
+            no_params = '{"jsonrpc": "2.0", "id": 4, "method": "tools/list"}\n'
+            self.assertEqual(broker.process_client_message(no_params), no_params)
+
+            # Blank, non-JSON, and non-object JSON pass through safely
+            for passthrough in ("", "\n", "   \r\n", "not json at all\n", "42\n"):
+                self.assertEqual(broker.process_client_message(passthrough), passthrough)
+                self.assertEqual(broker.process_server_message(passthrough), passthrough)
+
+            # Client batch
+            client_batch = json.dumps([
+                {"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"email": "[[EMAIL_1]]"}},
+                {"jsonrpc": "2.0", "method": "notifications/ping", "params": {"note": "[[CUSTOMER_1]]"}},
+            ]) + "\r\n"
+            batch_out = broker.process_client_message(client_batch)
+            self.assertTrue(batch_out.endswith("\r\n"))
+            batch_parsed = json.loads(batch_out)
+            self.assertEqual(batch_parsed[0]["params"]["email"], "alice@example.com")
+            self.assertEqual(batch_parsed[1]["params"]["note"], "Acme Corp")
+
+            # Server response redacts result, params, and error while respecting SKIP_KEYS/base64/data:
+            server_resp = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "content": [
+                        {"type": "text", "text": "Token sk-mcpsecret1234567890 for bob@example.com at 10.20.30.40"},
+                        {"type": "base64", "data": "sk-keepbase64field123456"},
+                    ],
+                    "uri": "data:text/plain,bob@example.com",
+                    "id": "bob@example.com",
+                },
+            }) + "\n"
+            redacted_resp_line = broker.process_server_message(server_resp)
+            self.assertNotIn("sk-mcpsecret1234567890", redacted_resp_line)
+            self.assertNotIn("bob@example.com", redacted_resp_line.replace('"id": "bob@example.com"', "").replace("data:text/plain,bob@example.com", ""))
+            self.assertNotIn("10.20.30.40", redacted_resp_line)
+            redacted_resp = json.loads(redacted_resp_line)
+            text_out = redacted_resp["result"]["content"][0]["text"]
+            self.assertIn("[[TOKEN_", text_out)
+            self.assertIn("[[EMAIL_", text_out)
+            self.assertIn("[[IP_", text_out)
+            self.assertEqual(redacted_resp["result"]["content"][1]["data"], "sk-keepbase64field123456")
+            self.assertEqual(redacted_resp["result"]["uri"], "data:text/plain,bob@example.com")
+            self.assertEqual(redacted_resp["result"]["id"], "bob@example.com")
+
+            # Server notification with params and error response
+            server_notif = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {"msg": "DB password=supersecretpass99"},
+            })
+            notif_out = json.loads(broker.process_server_message(server_notif))
+            self.assertNotIn("supersecretpass99", notif_out["params"]["msg"])
+            self.assertIn("[[PASSWORD_", notif_out["params"]["msg"])
+
+            server_err = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "error": {"code": -32000, "message": "Auth failed for carol@example.com", "data": {"ip": "192.168.10.20"}},
+            })
+            err_out = json.loads(broker.process_server_message(server_err))
+            self.assertNotIn("carol@example.com", err_out["error"]["message"])
+            self.assertNotIn("192.168.10.20", err_out["error"]["data"]["ip"])
+            self.assertIn("[[EMAIL_", err_out["error"]["message"])
+            self.assertIn("[[IP_", err_out["error"]["data"]["ip"])
+
+            # Server batch
+            server_batch = json.dumps([
+                {"jsonrpc": "2.0", "id": 11, "result": {"email": "dave@example.com"}},
+                {"jsonrpc": "2.0", "id": 12, "error": {"code": -1, "message": "ip 172.16.5.4"}},
+            ])
+            sbatch_out = json.loads(broker.process_server_message(server_batch))
+            self.assertNotIn("dave@example.com", sbatch_out[0]["result"]["email"])
+            self.assertNotIn("172.16.5.4", sbatch_out[1]["error"]["message"])
+
+    def test_mcp_broker_run_stdio_bridge_roundtrip(self):
+        from prosze_cli.mcp import MCPBroker
+
+        with tempfile.TemporaryDirectory() as directory:
+            server_script = Path(directory) / "mock_mcp_server.py"
+            server_script.write_text(
+                "import json, sys\n"
+                "exit_code = int(sys.argv[1]) if len(sys.argv) > 1 else 0\n"
+                "while True:\n"
+                "    raw = sys.stdin.readline()\n"
+                "    if not raw:\n"
+                "        break\n"
+                "    line = raw.strip()\n"
+                "    if not line:\n"
+                "        sys.stdout.write(raw)\n"
+                "        sys.stdout.flush()\n"
+                "        continue\n"
+                "    msg = json.loads(line)\n"
+                "    method = msg.get('method')\n"
+                "    if method == 'tools/call':\n"
+                "        name = msg['params']['name']\n"
+                "        args = msg['params'].get('arguments', {})\n"
+                "        if name == 'get_secret':\n"
+                "            resp = {'jsonrpc': '2.0', 'id': msg['id'], 'result': {'token': 'sk-live-pipe-token-123456'}}\n"
+                "        elif name == 'echo_user':\n"
+                "            resp = {'jsonrpc': '2.0', 'id': msg['id'], 'result': {'seen': args}}\n"
+                "        elif name == 'fail_with_secret':\n"
+                "            resp = {'jsonrpc': '2.0', 'id': msg['id'], 'error': {'code': -32001, 'message': 'leak admin@corp.local'}}\n"
+                "        else:\n"
+                "            resp = {'jsonrpc': '2.0', 'id': msg['id'], 'result': {'ok': True}}\n"
+                "        sys.stdout.write(json.dumps(resp) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "    elif method == 'tools/list':\n"
+                "        resp = {'jsonrpc': '2.0', 'id': msg['id'], 'result': {'tools': ['get_secret', 'echo_user']}}\n"
+                "        sys.stdout.write(json.dumps(resp) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "sys.exit(exit_code)\n",
+                encoding="utf-8",
+            )
+
+            # 1) Static StringIO round-trip + exit code check
+            v = self.make_vault(directory)
+            v.add_term("CUSTOMER=Acme Corp")
+            safe_cust, _ = v.redact("Acme Corp")
+            self.assertEqual(safe_cust, "[[CUSTOMER_1]]")
+            broker = MCPBroker(v)
+
+            requests_text = (
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"
+                + "\n"
+                + json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "echo_user", "arguments": {"customer": "[[CUSTOMER_1]]"}},
+                }) + "\n"
+                + json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "fail_with_secret", "arguments": {}},
+                }) + "\n"
+            )
+            out_buf = io.StringIO()
+            rc = broker.run_stdio_bridge(
+                [sys.executable, str(server_script), "5"],
+                in_stream=io.StringIO(requests_text),
+                out_stream=out_buf,
+            )
+            self.assertEqual(rc, 5)
+            out_lines = [ln for ln in out_buf.getvalue().splitlines() if ln.strip()]
+            self.assertEqual(len(out_lines), 3)
+            self.assertEqual(json.loads(out_lines[0])["result"]["tools"], ["get_secret", "echo_user"])
+            echo_res = json.loads(out_lines[1])["result"]["seen"]
+            self.assertEqual(echo_res["customer"], "[[CUSTOMER_1]]")
+            err_res = json.loads(out_lines[2])["error"]
+            self.assertNotIn("admin@corp.local", err_res["message"])
+            self.assertIn("[[EMAIL_", err_res["message"])
+
+            # 2) Binary BytesIO stream support
+            bin_out = io.BytesIO()
+            rc_bin = broker.run_stdio_bridge(
+                [sys.executable, str(server_script), "0"],
+                in_stream=io.BytesIO(requests_text.encode("utf-8")),
+                out_stream=bin_out,
+            )
+            self.assertEqual(rc_bin, 0)
+            self.assertIn(b"[[CUSTOMER_1]]", bin_out.getvalue())
+            self.assertNotIn(b"admin@corp.local", bin_out.getvalue())
+
+            # 3) Live bidirectional os.pipe() multi-turn test (proves zero buffering deadlock)
+            v_live = Vault(str(Path(directory) / "live_map.tsv"), ephemeral=True)
+            v_live._ner_attempted = True
+            live_broker = MCPBroker(v_live)
+
+            c2b_r, c2b_w = os.pipe()
+            b2c_r, b2c_w = os.pipe()
+            in_pipe = os.fdopen(c2b_r, "rb", buffering=0)
+            out_pipe = os.fdopen(b2c_w, "wb", buffering=0)
+            host_writer = os.fdopen(c2b_w, "wb", buffering=0)
+            host_reader = os.fdopen(b2c_r, "rb", buffering=0)
+
+            bridge_rc: list[int] = []
+
+            def _run_bridge() -> None:
+                try:
+                    bridge_rc.append(
+                        live_broker.run_stdio_bridge(
+                            [sys.executable, str(server_script), "0"],
+                            in_stream=in_pipe,
+                            out_stream=out_pipe,
+                        )
+                    )
+                finally:
+                    out_pipe.close()
+                    in_pipe.close()
+
+            t = threading.Thread(target=_run_bridge, daemon=True)
+            t.start()
+            try:
+                # Turn 1: get secret from server -> host receives [[TOKEN_1]] before closing stdin
+                req1 = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 100,
+                    "method": "tools/call",
+                    "params": {"name": "get_secret", "arguments": {}},
+                }).encode("utf-8") + b"\n"
+                host_writer.write(req1)
+                host_writer.flush()
+
+                resp1_raw = host_reader.readline()
+                resp1 = json.loads(resp1_raw.decode("utf-8"))
+                token_ph = resp1["result"]["token"]
+                self.assertRegex(token_ph, r"^\[\[TOKEN_\d+\]\]$")
+                self.assertNotIn(b"sk-live-pipe-token-123456", resp1_raw)
+
+                # Turn 2: pass [[TOKEN_1]] back -> server sees real token, host sees placeholder again
+                req2 = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 101,
+                    "method": "tools/call",
+                    "params": {"name": "echo_user", "arguments": {"auth": token_ph}},
+                }).encode("utf-8") + b"\n"
+                host_writer.write(req2)
+                host_writer.flush()
+
+                resp2_raw = host_reader.readline()
+                resp2 = json.loads(resp2_raw.decode("utf-8"))
+                self.assertEqual(resp2["result"]["seen"]["auth"], token_ph)
+                self.assertEqual(v_live.fwd[token_ph], "sk-live-pipe-token-123456")
+            finally:
+                host_writer.close()
+                host_reader.close()
+                t.join(timeout=5.0)
+
+            self.assertFalse(t.is_alive())
+            self.assertEqual(bridge_rc, [0])
+
+    def test_interactive_wrap_streaming_and_strict_restore(self):
+        from prosze_cli.mcp import run_interactive_wrap
+
+        with tempfile.TemporaryDirectory() as directory:
+            map_path = Path(directory) / "wrap_map.tsv"
+            map_path.write_text("[[TOKEN_1]]\tpreloaded-secret-do-not-leak\n", encoding="utf-8")
+
+            child_script = Path(directory) / "mock_cli_tool.py"
+            child_script.write_text(
+                "import sys, time\n"
+                "seen = sys.stdin.read()\n"
+                "if 'alice@example.com' in seen or 'MIIEowIBAAKCAQEA1234567890' in seen:\n"
+                "    sys.stderr.write('ERROR: unredacted secret reached child!\\n')\n"
+                "    sys.exit(99)\n"
+                "if '[[EMAIL_1]]' not in seen or '[[PRIVKEY_1]]' not in seen:\n"
+                "    sys.stderr.write('ERROR: missing placeholders in child stdin!\\n')\n"
+                "    sys.exit(98)\n"
+                "chunks = [\n"
+                "    b'Out: [[EMA',\n"
+                "    b'IL_1]] | [[PRIV',\n"
+                "    b'KEY_1]] | [[TOKEN',\n"
+                "    b'_1]]\\n',\n"
+                "]\n"
+                "for ch in chunks:\n"
+                "    sys.stdout.buffer.write(ch)\n"
+                "    sys.stdout.buffer.flush()\n"
+                "    time.sleep(0.02)\n"
+                "sys.exit(7)\n",
+                encoding="utf-8",
+            )
+
+            v = Vault(str(map_path), strict_restore=False)
+            v._ner_attempted = True
+            self.assertFalse(v.strict_restore)
+
+            user_input = (
+                "Analyze alice@example.com and [[TOKEN_1]]\n"
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                "MIIEowIBAAKCAQEA1234567890\n"
+                "-----END RSA PRIVATE KEY-----\n"
+            )
+            out_buf = io.StringIO()
+            rc = run_interactive_wrap(
+                v,
+                [sys.executable, str(child_script)],
+                in_stream=io.StringIO(user_input),
+                out_stream=out_buf,
+            )
+            self.assertTrue(v.strict_restore)
+            self.assertEqual(rc, 7)
+            expected = (
+                "Out: alice@example.com | "
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                "MIIEowIBAAKCAQEA1234567890\n"
+                "-----END RSA PRIVATE KEY----- | "
+                "[[TOKEN_1]]\n"
+            )
+            self.assertEqual(out_buf.getvalue(), expected)
+
+            # Binary in_stream/out_stream check
+            v2 = Vault(str(map_path), strict_restore=False)
+            v2._ner_attempted = True
+            bin_out = io.BytesIO()
+            rc2 = run_interactive_wrap(
+                v2,
+                [sys.executable, str(child_script)],
+                in_stream=io.BytesIO(user_input.encode("utf-8")),
+                out_stream=bin_out,
+            )
+            self.assertEqual(rc2, 7)
+            self.assertEqual(bin_out.getvalue().decode("utf-8"), expected)
+
+    def test_cli_broker_mcp_and_wrap_help_and_dispatch(self):
+        command = [sys.executable, "-m", "prosze_cli"]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PACKAGE_DIR)
+
+        # Help checks
+        broker_help = subprocess.run(
+            command + ["broker", "--help"],
+            cwd=PACKAGE_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(broker_help.returncode, 0)
+        self.assertIn("serve", broker_help.stdout)
+        self.assertIn("mcp", broker_help.stdout)
+        self.assertIn("wrap", broker_help.stdout)
+
+        for subcmd in ("mcp", "wrap"):
+            h = subprocess.run(
+                command + ["broker", subcmd, "--help"],
+                cwd=PACKAGE_DIR,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(h.returncode, 0)
+            self.assertIn("--ephemeral", h.stdout)
+            self.assertIn("--no-ner", h.stdout)
+            self.assertIn("--map", h.stdout)
+
+        # Missing -- <cmd> errors
+        for subcmd in ("mcp", "wrap"):
+            err_buf = io.StringIO()
+            with patch("sys.stderr", new=err_buf), self.assertRaises(SystemExit) as cm:
+                cli_main(["broker", subcmd, "--no-ner", "--ephemeral"])
+            self.assertNotEqual(cm.exception.code, 0)
+            self.assertIn("usage:", err_buf.getvalue())
+
+            missing_err = io.StringIO()
+            with patch("sys.stderr", new=missing_err), self.assertRaises(SystemExit) as cm2:
+                cli_main(["broker", subcmd, "--no-ner", "--ephemeral", "--", "nonexistent_cmd_xyz_123"])
+            self.assertNotEqual(cm2.exception.code, 0)
+            self.assertIn("command not found", missing_err.getvalue())
+
+        # End-to-end CLI subprocess tests for `broker mcp` and `broker wrap`
+        with tempfile.TemporaryDirectory() as directory:
+            mcp_map = Path(directory) / "cli_mcp_map.tsv"
+            mcp_map.write_text("[[CUSTOMER_1]]\tAcme Corp\n", encoding="utf-8")
+            mcp_script = Path(directory) / "cli_mcp.py"
+            mcp_script.write_text(
+                "import json, sys\n"
+                "for line in sys.stdin:\n"
+                "    if not line.strip(): continue\n"
+                "    req = json.loads(line)\n"
+                "    arg = req.get('params', {}).get('who', '')\n"
+                "    if arg != 'Acme Corp':\n"
+                "        sys.exit(42)\n"
+                "    resp = {'jsonrpc': '2.0', 'id': req['id'], 'result': {'echo': arg, 'secret': 'sk-cli-mcp-1234567890'}}\n"
+                "    sys.stdout.buffer.write((json.dumps(resp) + '\\n').encode('utf-8'))\n"
+                "    sys.stdout.buffer.flush()\n",
+                encoding="utf-8",
+            )
+            mcp_res = subprocess.run(
+                command + [
+                    "broker", "mcp", "--no-ner", "--map", str(mcp_map), "--term", "CUSTOMER=Acme Corp",
+                    "--", sys.executable, str(mcp_script),
+                ],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input=json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"who": "[[CUSTOMER_1]]"},
+                }) + "\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(mcp_res.returncode, 0, msg=mcp_res.stderr)
+            mcp_out = json.loads(mcp_res.stdout.strip())
+            self.assertEqual(mcp_out["result"]["echo"], "[[CUSTOMER_1]]")
+            self.assertNotIn("sk-cli-mcp-1234567890", mcp_res.stdout)
+            self.assertNotIn("Acme Corp", mcp_res.stdout)
+            self.assertRegex(mcp_out["result"]["secret"], r"^\[\[TOKEN_\d+\]\]$")
+
+            wrap_map = Path(directory) / "cli_wrap_map.tsv"
+            wrap_map.write_text("[[TOKEN_1]]\tpreloaded-wrap-secret\n", encoding="utf-8")
+            wrap_script = Path(directory) / "cli_wrap.py"
+            wrap_script.write_text(
+                "import sys\n"
+                "data = sys.stdin.read()\n"
+                "if 'alice@example.com' in data or '[[EMAIL_1]]' not in data:\n"
+                "    sys.exit(43)\n"
+                "sys.stdout.buffer.write(('CHILD:' + data).encode('utf-8'))\n"
+                "sys.stdout.buffer.flush()\n"
+                "sys.exit(3)\n",
+                encoding="utf-8",
+            )
+            wrap_res = subprocess.run(
+                command + [
+                    "broker", "wrap", "--no-ner", "--map", str(wrap_map),
+                    "--", sys.executable, str(wrap_script),
+                ],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Hi alice@example.com [[TOKEN_1]]\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(wrap_res.returncode, 3)
+            self.assertEqual(wrap_res.stdout, "CHILD:Hi alice@example.com [[TOKEN_1]]\n")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -134,6 +134,36 @@ def cmd_broker_serve(
         server.server_close()
 
 
+def _run_broker_command(subcmd: str, cmd: list[str], runner) -> None:
+    if not cmd:
+        sys.stderr.write(f"prosze: usage: prosze broker {subcmd} [options] -- command args...\n")
+        sys.exit(1)
+    try:
+        rc = runner(cmd)
+    except FileNotFoundError:
+        sys.stderr.write(f"prosze: command not found: {cmd[0]}\n")
+        sys.exit(1)
+    except OSError as exc:
+        sys.stderr.write(f"prosze: failed to start {cmd[0]}: {exc}\n")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        return
+    if rc:
+        sys.exit(rc)
+
+
+def cmd_broker_mcp(v: Vault, cmd: list[str]) -> None:
+    from prosze_cli.mcp import MCPBroker
+
+    _run_broker_command("mcp", cmd, MCPBroker(v).run_stdio_bridge)
+
+
+def cmd_broker_wrap(v: Vault, cmd: list[str]) -> None:
+    from prosze_cli.mcp import run_interactive_wrap
+
+    _run_broker_command("wrap", cmd, lambda c: run_interactive_wrap(v, c))
+
+
 # ---- CLI ----------------------------------------------------------------
 def cli_main(argv: Optional[list[str]] = None) -> None:
     if argv is None:
@@ -178,6 +208,16 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         action="store_true",
         help="allow binding to non-loopback hosts",
     )
+    broker_sub.add_parser(
+        "mcp",
+        parents=[common],
+        help="run stdio JSON-RPC 2.0 MCP privacy broker",
+    )
+    broker_sub.add_parser(
+        "wrap",
+        parents=[common],
+        help="wrap an interactive CLI session with redaction and strict restoration",
+    )
 
     a = ap.parse_args(cli_args)
     if not a.cmd:
@@ -214,6 +254,10 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         except ValueError as exc:
             sys.stderr.write(f"{exc}\n")
             sys.exit(1)
+    elif a.cmd == "broker" and a.broker_cmd == "mcp":
+        cmd_broker_mcp(v, cmd)
+    elif a.cmd == "broker" and a.broker_cmd == "wrap":
+        cmd_broker_wrap(v, cmd)
     else:
         ap.print_help()
 
