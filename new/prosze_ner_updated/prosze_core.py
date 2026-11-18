@@ -355,6 +355,50 @@ PH = re.compile(r"\[\[[A-Z][A-Z0-9_]*_\d+\]\]")
 PH_IDX = re.compile(r"^\[\[([A-Z][A-Z0-9_]*)_(\d+)\]\]$")
 B64_CAND = re.compile(r"\b[A-Za-z0-9+/]{24,}(?:={1,2}(?![A-Za-z0-9+/=])|\b)")
 
+# ---------------------------------------------------------------- brand & color
+BRAND_PALETTE = {
+    "cloakroom_pine": ("#12392F", (18, 57, 47)),
+    "stamp_red": ("#E8432A", (232, 67, 42)),
+    "stamp_red_dark": ("#FF6A4D", (255, 106, 77)),
+    "ticket_cream": ("#F5EFE2", (245, 239, 226)),
+    "ink": ("#0F1A17", (15, 26, 23)),
+    "pine_mint": ("#8FD0B3", (143, 208, 179)),
+    "slate": ("#56635D", (86, 99, 93)),
+    "perforation": ("#D9D1BF", (217, 209, 191)),
+}
+COLOR_MODES = ("auto", "always", "never")
+ANSI_RESET = "\x1b[0m"
+ANSI_TICKET = "\x1b[1;38;2;255;106;77m"     # Dark-Ground Stamp Red (#FF6A4D)
+ANSI_PINE_MINT = "\x1b[1;38;2;143;208;179m" # Pine Mint (#8FD0B3)
+ANSI_PERFORATION = "\x1b[38;2;217;209;191m" # Perforation (#D9D1BF)
+ANSI_SLATE = "\x1b[38;2;86;99;93m"          # Slate (#56635D)
+
+
+def should_use_color(color_mode: str = "auto", stream=None) -> bool:
+    """Return whether ANSI truecolor output is active for color_mode and stream."""
+    mode = (color_mode or "auto").lower()
+    if mode not in COLOR_MODES:
+        raise ValueError(f"prosze: --color must be auto, always or never (got {color_mode!r})")
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    target = sys.stdout if stream is None else stream
+    isatty = getattr(target, "isatty", None)
+    try:
+        return bool(isatty and isatty())
+    except Exception:
+        return False
+
+
+def highlight_tickets(text: str) -> str:
+    """Highlight [[CAT_N]] placeholders in truecolor Dark-Ground Stamp Red (#FF6A4D)."""
+    if "[[" not in text:
+        return text
+    return PH.sub(lambda m: f"{ANSI_TICKET}{m.group(0)}{ANSI_RESET}", text)
+
 
 # ---------------------------------------------------------------- authenticated encryption
 def _derive_keys(passphrase: str, nonce_hex: str) -> Tuple[bytes, bytes]:
@@ -708,7 +752,7 @@ class Vault:
             return json.dumps(v, ensure_ascii=False)[1:-1] if json_escaped else v
         return PH.sub(sub, text)
 
-    def redact_stream(self, in_stream, out_stream, chunk_size: int = 65536) -> int:
+    def redact_stream(self, in_stream, out_stream, chunk_size: int = 65536, color: bool = False) -> int:
         """Stream-redact in_stream to out_stream using a sliding window."""
         if chunk_size <= 0:
             chunk_size = 65536
@@ -728,7 +772,8 @@ class Vault:
             buf = buf[count:]
             safe, n = self.redact(prefix)
             total_hits += n
-            _write_stream_text(out_stream, safe, binary_out)
+            out_text = highlight_tickets(safe) if color else safe
+            _write_stream_text(out_stream, out_text, binary_out)
 
         for chunk, at_eof in _iter_stream_chunks(in_stream, chunk_size):
             if chunk:
@@ -882,7 +927,11 @@ def walk(o, fn):
 
 # ---------------------------------------------------------------- I/O helpers
 def read_stdin():
-    return sys.stdin.buffer.read().decode("utf-8", "replace")
+    buf = getattr(sys.stdin, "buffer", None)
+    if buf is not None:
+        return buf.read().decode("utf-8", "replace")
+    raw = sys.stdin.read()
+    return raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
 
 
 def read_block(prompt):

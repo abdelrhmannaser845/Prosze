@@ -624,6 +624,91 @@ static void test_streaming_redaction_and_restoration()
     assert(bout.str().find("mail@example.com") == string::npos);
 }
 
+static void test_brand_palette_and_color_highlighting()
+{
+    assert(string(BRAND_CLOAKROOM_PINE.hex) == "#12392F");
+    assert(BRAND_CLOAKROOM_PINE.r == 18 && BRAND_CLOAKROOM_PINE.g == 57 && BRAND_CLOAKROOM_PINE.b == 47);
+    assert(string(BRAND_STAMP_RED.hex) == "#E8432A");
+    assert(BRAND_STAMP_RED.r == 232 && BRAND_STAMP_RED.g == 67 && BRAND_STAMP_RED.b == 42);
+    assert(string(BRAND_STAMP_RED_DARK.hex) == "#FF6A4D");
+    assert(BRAND_STAMP_RED_DARK.r == 255 && BRAND_STAMP_RED_DARK.g == 106 && BRAND_STAMP_RED_DARK.b == 77);
+    assert(string(BRAND_TICKET_CREAM.hex) == "#F5EFE2");
+    assert(BRAND_TICKET_CREAM.r == 245 && BRAND_TICKET_CREAM.g == 239 && BRAND_TICKET_CREAM.b == 226);
+    assert(string(BRAND_INK.hex) == "#0F1A17");
+    assert(BRAND_INK.r == 15 && BRAND_INK.g == 26 && BRAND_INK.b == 23);
+    assert(string(BRAND_PINE_MINT.hex) == "#8FD0B3");
+    assert(BRAND_PINE_MINT.r == 143 && BRAND_PINE_MINT.g == 208 && BRAND_PINE_MINT.b == 179);
+    assert(string(BRAND_SLATE.hex) == "#56635D");
+    assert(BRAND_SLATE.r == 86 && BRAND_SLATE.g == 99 && BRAND_SLATE.b == 93);
+    assert(string(BRAND_PERFORATION.hex) == "#D9D1BF");
+    assert(BRAND_PERFORATION.r == 217 && BRAND_PERFORATION.g == 209 && BRAND_PERFORATION.b == 191);
+
+    assert(valid_color_mode("auto"));
+    assert(valid_color_mode("always"));
+    assert(valid_color_mode("never"));
+    assert(!valid_color_mode("neon"));
+
+    {
+        ScopedEnvVar guard_no_color("NO_COLOR", "");
+        assert(should_use_color("always", false));
+        assert(!should_use_color("never", true));
+        assert(should_use_color("auto", true));
+        assert(!should_use_color("auto", false));
+    }
+    {
+        ScopedEnvVar guard_no_color("NO_COLOR", "1");
+        assert(!should_use_color("auto", true));
+        assert(should_use_color("always", false));
+    }
+
+    string highlighted = highlight_tickets("Contact [[CUSTOMER_1]] at [[EMAIL_1]].");
+    assert(highlighted ==
+        "Contact \x1b[1;38;2;255;106;77m[[CUSTOMER_1]]\x1b[0m at "
+        "\x1b[1;38;2;255;106;77m[[EMAIL_1]]\x1b[0m.");
+    assert(highlight_tickets("Plain text without tickets.") == "Plain text without tickets.");
+
+    prosze v;
+    v.name_level = 0;
+    istringstream sin("Mail alice@example.com now.");
+    ostringstream sout;
+    v.redact_stream(sin, sout, 65536, true);
+    assert(sout.str() == "Mail \x1b[1;38;2;255;106;77m[[EMAIL_1]]\x1b[0m now.");
+}
+
+static void test_confirm_redaction_approval_and_rejection()
+{
+    vector<string> tickets = { "[[CUSTOMER_1]]", "[[EMAIL_1]]" };
+
+    // Approvals: y, yes, YES
+    for (const char* ans : { "y\n", "Y\n", "yes\n", "YES\n", "  YeS \r\n" })
+    {
+        istringstream in(ans);
+        ostringstream err;
+        assert(confirm_redaction(2, tickets, &in, err, false));
+        assert(err.str().find("2 item(s) to redact") != string::npos);
+        assert(err.str().find("[[CUSTOMER_1]]") != string::npos);
+        assert(err.str().find("[[EMAIL_1]]") != string::npos);
+        assert(err.str().find("Approve redaction? [y/N]: ") != string::npos);
+    }
+
+    // Rejections: n, no, empty line, EOF, other
+    for (const char* ans : { "n\n", "no\n", "\n", "", "maybe\n" })
+    {
+        istringstream in(ans);
+        ostringstream err;
+        assert(!confirm_redaction(1, { "[[EMAIL_1]]" }, &in, err, false));
+        assert(err.str().find("Approve redaction? [y/N]: ") != string::npos);
+    }
+
+    // Zero hits does not prompt
+    {
+        istringstream in("");
+        ostringstream err;
+        assert(confirm_redaction(0, {}, &in, err, false));
+        assert(err.str().empty());
+    }
+}
+
 int main(int argc, char** argv)
 {
     if (argc >= 2 && string(argv[1]) == "--cat-helper")
@@ -655,5 +740,7 @@ int main(int argc, char** argv)
     test_prefilter_accuracy_and_zero_match_fast_path();
     test_50kb_throughput();
     test_streaming_redaction_and_restoration();
+    test_brand_palette_and_color_highlighting();
+    test_confirm_redaction_approval_and_rejection();
     return 0;
 }

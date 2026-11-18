@@ -1790,6 +1790,365 @@ class ApplicationTests(unittest.TestCase):
             self.assertEqual(wrap_res.returncode, 3)
             self.assertEqual(wrap_res.stdout, "CHILD:Hi alice@example.com [[TOKEN_1]]\n")
 
+    def test_brand_palette_and_color_highlighting(self):
+        from prosze_core import BRAND_PALETTE, highlight_tickets, should_use_color
+
+        expected_palette = {
+            "cloakroom_pine": ("#12392F", (18, 57, 47)),
+            "stamp_red": ("#E8432A", (232, 67, 42)),
+            "stamp_red_dark": ("#FF6A4D", (255, 106, 77)),
+            "ticket_cream": ("#F5EFE2", (245, 239, 226)),
+            "ink": ("#0F1A17", (15, 26, 23)),
+            "pine_mint": ("#8FD0B3", (143, 208, 179)),
+            "slate": ("#56635D", (86, 99, 93)),
+            "perforation": ("#D9D1BF", (217, 209, 191)),
+        }
+        self.assertEqual(BRAND_PALETTE, expected_palette)
+
+        plain = "Contact [[CUSTOMER_1]] at [[EMAIL_1]]."
+        colored = highlight_tickets(plain)
+        self.assertEqual(
+            colored,
+            "Contact \x1b[1;38;2;255;106;77m[[CUSTOMER_1]]\x1b[0m at "
+            "\x1b[1;38;2;255;106;77m[[EMAIL_1]]\x1b[0m.",
+        )
+        self.assertEqual(highlight_tickets("No tickets here."), "No tickets here.")
+
+        class FakeStream:
+            def __init__(self, tty: bool):
+                self._tty = tty
+
+            def isatty(self) -> bool:
+                return self._tty
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NO_COLOR", None)
+            self.assertTrue(should_use_color("always", FakeStream(False)))
+            self.assertFalse(should_use_color("never", FakeStream(True)))
+            self.assertTrue(should_use_color("auto", FakeStream(True)))
+            self.assertFalse(should_use_color("auto", FakeStream(False)))
+
+        with patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            self.assertFalse(should_use_color("auto", FakeStream(True)))
+            self.assertTrue(should_use_color("always", FakeStream(False)))
+
+        with patch.dict(os.environ, {"NO_COLOR": ""}, clear=False):
+            self.assertTrue(should_use_color("auto", FakeStream(True)))
+
+        with self.assertRaises(ValueError):
+            should_use_color("bogus", FakeStream(True))
+
+    def test_cli_color_flag_always_never_no_color_and_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path = Path(directory) / "map.tsv"
+            command = [sys.executable, "-m", "prosze_cli"]
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(PACKAGE_DIR)
+            env.pop("NO_COLOR", None)
+
+            # --color always emits truecolor Stamp Red even on a pipe
+            res_always = subprocess.run(
+                command + ["redact", "--no-ner", "--color", "always", "--map", str(map_path), "--term", "CUSTOMER=Acme Corp"],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Contact Acme Corp at alice@example.com.",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res_always.returncode, 0, msg=res_always.stderr)
+            self.assertEqual(
+                res_always.stdout,
+                "Contact \x1b[1;38;2;255;106;77m[[CUSTOMER_1]]\x1b[0m at "
+                "\x1b[1;38;2;255;106;77m[[EMAIL_1]]\x1b[0m.",
+            )
+
+            # --color always with --stream also highlights tickets
+            res_stream_always = subprocess.run(
+                command + ["redact", "--stream", "--no-ner", "--color", "always", "--map", str(map_path)],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Mail alice@example.com.",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res_stream_always.returncode, 0, msg=res_stream_always.stderr)
+            self.assertIn("\x1b[1;38;2;255;106;77m[[EMAIL_1]]\x1b[0m", res_stream_always.stdout)
+
+            # --color never emits plain uncolored text
+            res_never = subprocess.run(
+                command + ["redact", "--no-ner", "--color", "never", "--map", str(map_path), "--term", "CUSTOMER=Acme Corp"],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Contact Acme Corp at alice@example.com.",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res_never.returncode, 0)
+            self.assertEqual(res_never.stdout, "Contact [[CUSTOMER_1]] at [[EMAIL_1]].")
+            self.assertNotIn("\x1b[", res_never.stdout)
+
+            # --color auto on non-TTY pipe emits plain text
+            res_auto = subprocess.run(
+                command + ["redact", "--no-ner", "--color", "auto", "--map", str(map_path), "--term", "CUSTOMER=Acme Corp"],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Contact Acme Corp at alice@example.com.",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res_auto.returncode, 0)
+            self.assertEqual(res_auto.stdout, "Contact [[CUSTOMER_1]] at [[EMAIL_1]].")
+
+            # Invalid --color value exits non-zero
+            res_bad = subprocess.run(
+                command + ["redact", "--no-ner", "--color", "neon", "--map", str(map_path)],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="hello",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(res_bad.returncode, 0)
+
+            # In-process TTY simulation respecting NO_COLOR under --color auto
+            class TtyStringIO(io.StringIO):
+                def isatty(self) -> bool:
+                    return True
+
+            with patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+                out_no_color = TtyStringIO()
+                tty_map = str(Path(directory) / "tty_map.tsv")
+                with patch("sys.stdin", new=io.StringIO("alice@example.com")), patch("sys.stdout", new=out_no_color), patch("sys.stderr", new=io.StringIO()):
+                    cli_main(["redact", "--no-ner", "--ephemeral", "--map", tty_map, "--color", "auto"])
+                self.assertEqual(out_no_color.getvalue(), "[[EMAIL_1]]")
+
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("NO_COLOR", None)
+                out_tty = TtyStringIO()
+                tty_map = str(Path(directory) / "tty_map.tsv")
+                with patch("sys.stdin", new=io.StringIO("alice@example.com")), patch("sys.stdout", new=out_tty), patch("sys.stderr", new=io.StringIO()):
+                    cli_main(["redact", "--no-ner", "--ephemeral", "--map", tty_map, "--color", "auto"])
+                self.assertEqual(out_tty.getvalue(), "\x1b[1;38;2;255;106;77m[[EMAIL_1]]\x1b[0m")
+
+    def test_tui_commands_vault_privacy_copy_and_eof(self):
+        from prosze_cli.tui import run_tui
+
+        with tempfile.TemporaryDirectory() as directory:
+            vault = self.make_vault(directory, ephemeral=True)
+            vault.add_term("SECRETKEY=super-secret-value-987654")
+            vault.redact("Initial alice@example.com and super-secret-value-987654.")
+
+            copied: list[str] = []
+            out_buf = io.StringIO()
+            commands = "\n".join([
+                "/help",
+                "/vault",
+                "Contact bob@example.com",
+                "/copy",
+                "/clear",
+                "/copy",
+                "Reply for [[EMAIL_1]]",
+                "/copy",
+                "/quit",
+            ]) + "\n"
+            rc = run_tui(
+                vault,
+                in_stream=io.StringIO(commands),
+                out_stream=out_buf,
+                color_mode="never",
+                clipboard_fn=copied.append,
+            )
+            self.assertEqual(rc, 0)
+            output = out_buf.getvalue()
+
+            # Brand banner & perforation dividers
+            self.assertIn("prosze — Keep what's yours. Nothing leaves until it has a ticket.", output)
+            self.assertIn("- - - - - - - - - - - -", output)
+
+            # /help lists all required slash commands
+            for slash_cmd in ("/copy", "/vault", "/clear", "/quit", "/help"):
+                self.assertIn(slash_cmd, output)
+
+            # /vault shows [[CAT_N]] -> <hidden> without exposing secrets or lengths
+            self.assertIn("[[EMAIL_1]] -> <hidden>", output)
+            self.assertIn("[[SECRETKEY_1]] -> <hidden>", output)
+            self.assertNotIn("super-secret-value-987654", output)
+            self.assertNotIn("25", output)  # length of super-secret-value-987654
+            self.assertNotIn("17", output)  # length of alice@example.com
+
+            # Redacted and restored outputs + /copy + /clear behavior
+            self.assertIn("Contact [[EMAIL_2]]", output)
+            self.assertIn("Reply for alice@example.com", output)
+            self.assertEqual(copied, ["Contact [[EMAIL_2]]", "Reply for alice@example.com"])
+            self.assertIn("Cleared", output)
+            self.assertIn("Nothing to copy", output)
+
+            # Color mode "always" highlights tickets in TUI output while /copy stays plain
+            copied_color: list[str] = []
+            color_out = io.StringIO()
+            run_tui(
+                vault,
+                in_stream=io.StringIO("Reach carol@example.com\n/copy\n/exit\n"),
+                out_stream=color_out,
+                color_mode="always",
+                clipboard_fn=copied_color.append,
+            )
+            self.assertIn("\x1b[1;38;2;255;106;77m[[EMAIL_3]]\x1b[0m", color_out.getvalue())
+            self.assertEqual(copied_color, ["Reach [[EMAIL_3]]"])
+
+            # Graceful EOF fallback on empty non-interactive input
+            eof_out = io.StringIO()
+            self.assertEqual(run_tui(vault, in_stream=io.StringIO(""), out_stream=eof_out, color_mode="never"), 0)
+            self.assertIn("prosze — Keep what's yours. Nothing leaves until it has a ticket.", eof_out.getvalue())
+
+            # Subprocess fallback for /copy when clipboard_fn is None
+            with patch("prosze_cli.tui.shutil.which", return_value="mock-clip"), \
+                 patch("prosze_cli.tui.subprocess.run") as mock_run:
+                sub_out = io.StringIO()
+                run_tui(
+                    vault,
+                    in_stream=io.StringIO("Send to dave@example.com\n/copy\n/quit\n"),
+                    out_stream=sub_out,
+                    color_mode="never",
+                    clipboard_fn=None,
+                )
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["input"], b"Send to [[EMAIL_4]]")
+
+            # CLI `prosze tui` dispatch via subprocess with EOF
+            command = [sys.executable, "-m", "prosze_cli"]
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(PACKAGE_DIR)
+            tui_res = subprocess.run(
+                command + ["tui", "--no-ner", "--ephemeral", "--color", "never"],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="/help\n/quit\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(tui_res.returncode, 0, msg=tui_res.stderr)
+            self.assertIn("prosze — Keep what's yours. Nothing leaves until it has a ticket.", tui_res.stdout)
+            self.assertIn("/vault", tui_res.stdout)
+
+    def test_confirm_redaction_approval_rejection_and_cli(self):
+        from prosze_cli import confirm_redaction
+
+        # Direct helper tests: approvals
+        for reply in ("y\n", "Y\n", "yes\n", "YES\n", "  YeS \n"):
+            err = io.StringIO()
+            ok = confirm_redaction(2, ["[[CUSTOMER_1]]", "[[EMAIL_1]]"], in_stream=io.StringIO(reply), err_stream=err)
+            self.assertTrue(ok, f"Expected approval for {reply!r}")
+            self.assertIn("2 item(s) to redact", err.getvalue())
+            self.assertIn("[[CUSTOMER_1]]", err.getvalue())
+            self.assertIn("[[EMAIL_1]]", err.getvalue())
+            self.assertIn("Approve redaction? [y/N]: ", err.getvalue())
+
+        # Direct helper tests: rejections (n, empty enter, EOF, bogus)
+        for reply in ("n\n", "no\n", "\n", "", "maybe\n"):
+            err = io.StringIO()
+            ok = confirm_redaction(1, ["[[EMAIL_1]]"], in_stream=io.StringIO(reply), err_stream=err)
+            self.assertFalse(ok, f"Expected rejection for {reply!r}")
+            self.assertIn("Approve redaction? [y/N]: ", err.getvalue())
+
+        # Zero count does not prompt
+        zero_err = io.StringIO()
+        self.assertTrue(confirm_redaction(0, [], in_stream=io.StringIO(""), err_stream=zero_err))
+        self.assertEqual(zero_err.getvalue(), "")
+
+        # CLI subprocess tests: headless fail-closed rejection on redact --confirm and run --confirm
+        with tempfile.TemporaryDirectory() as directory:
+            map_path = Path(directory) / "confirm_map.tsv"
+            sentinel = Path(directory) / "child_ran.txt"
+            child_script = Path(directory) / "child.py"
+            child_script.write_text(
+                f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            command = [sys.executable, "-m", "prosze_cli"]
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(PACKAGE_DIR)
+            detach_kw = {"creationflags": subprocess.DETACHED_PROCESS} if os.name == "nt" else {"start_new_session": True}
+
+            rej_redact = subprocess.run(
+                command + ["redact", "--no-ner", "--confirm", "--map", str(map_path)],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Contact alice@example.com",
+                capture_output=True,
+                text=True,
+                check=False,
+                **detach_kw,
+            )
+            self.assertEqual(rej_redact.returncode, 1)
+            self.assertEqual(rej_redact.stdout, "")
+            self.assertFalse(map_path.exists())
+
+            rej_run = subprocess.run(
+                command + ["run", "--no-ner", "--confirm", "--map", str(map_path), "--", sys.executable, str(child_script)],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Contact alice@example.com",
+                capture_output=True,
+                text=True,
+                check=False,
+                **detach_kw,
+            )
+            self.assertEqual(rej_run.returncode, 1)
+            self.assertEqual(rej_run.stdout, "")
+            self.assertFalse(sentinel.exists())
+
+            # Zero items redacted proceeds without prompting
+            ok_zero = subprocess.run(
+                command + ["redact", "--no-ner", "--confirm", "--ephemeral", "--map", str(map_path)],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input="Plain safe text.",
+                capture_output=True,
+                text=True,
+                check=False,
+                **detach_kw,
+            )
+            self.assertEqual(ok_zero.returncode, 0, msg=ok_zero.stderr)
+            self.assertEqual(ok_zero.stdout, "Plain safe text.")
+
+            # In-process cli_main with approved vs rejected confirm_redaction on redact & run
+            out_ok = io.StringIO()
+            err_ok = io.StringIO()
+            with patch("sys.stdin", new=io.StringIO("Contact alice@example.com")), \
+                 patch("sys.stdout", new=out_ok), \
+                 patch("sys.stderr", new=err_ok), \
+                 patch("prosze_cli.confirm_redaction", return_value=True) as mock_confirm:
+                cli_main(["redact", "--no-ner", "--confirm", "--color", "never", "--map", str(map_path)])
+            mock_confirm.assert_called_once()
+            self.assertEqual(out_ok.getvalue(), "Contact [[EMAIL_1]]")
+            self.assertTrue(map_path.exists())
+            map_path.unlink()
+
+            # Approval on run executes child and restores output
+            run_child = Path(directory) / "run_echo.py"
+            run_child.write_text(
+                "import sys\n"
+                "data = sys.stdin.read()\n"
+                "sys.stdout.write('ECHO:' + data)\n",
+                encoding="utf-8",
+            )
+            out_run = io.StringIO()
+            with patch("sys.stdin", new=io.StringIO("Contact bob@example.com")), \
+                 patch("sys.stdout", new=out_run), \
+                 patch("sys.stderr", new=io.StringIO()), \
+                 patch("prosze_cli.confirm_redaction", return_value=True), \
+                 self.assertRaises(SystemExit) as run_exit:
+                cli_main(["run", "--no-ner", "--confirm", "--map", str(map_path), "--", sys.executable, str(run_child)])
+            self.assertEqual(run_exit.exception.code, 0)
+            self.assertEqual(out_run.getvalue(), "ECHO:Contact bob@example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

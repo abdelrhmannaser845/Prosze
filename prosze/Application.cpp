@@ -26,6 +26,10 @@
 //   --map FILE                    mapping file (default ./.prosze-map)
 //   --ephemeral                   keep mapping in memory only, never write to disk
 //   --passphrase KEY              encrypt mapping file with KEY (or PROSZE_KEY env)
+//   --strict-restore              only restore placeholders redacted during this session
+//   --stream                      stream stdin/stdout in chunks
+//   --color auto|always|never     highlight [[CAT_N]] placeholders in redact output (default auto)
+//   --confirm                     require approval on stderr before emitting redacted output or running cmd
 //   --names LEVEL                 automatic name finder: off | strict | normal (default) | aggressive
 //   --explain                     print what was hidden (placeholder = real value) to stderr
 //
@@ -1269,6 +1273,121 @@ public:
     }
 };
 
+struct BrandColor
+{
+    const char* name;
+    const char* hex;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+};
+
+static constexpr BrandColor BRAND_CLOAKROOM_PINE = { "Cloakroom Pine", "#12392F", 18, 57, 47 };
+static constexpr BrandColor BRAND_STAMP_RED      = { "Stamp Red",      "#E8432A", 232, 67, 42 };
+static constexpr BrandColor BRAND_STAMP_RED_DARK = { "Stamp Red Dark", "#FF6A4D", 255, 106, 77 };
+static constexpr BrandColor BRAND_TICKET_CREAM   = { "Ticket Cream",   "#F5EFE2", 245, 239, 226 };
+static constexpr BrandColor BRAND_INK            = { "Ink",            "#0F1A17", 15, 26, 23 };
+static constexpr BrandColor BRAND_PINE_MINT      = { "Pine Mint",      "#8FD0B3", 143, 208, 179 };
+static constexpr BrandColor BRAND_SLATE          = { "Slate",          "#56635D", 86, 99, 93 };
+static constexpr BrandColor BRAND_PERFORATION    = { "Perforation",    "#D9D1BF", 217, 209, 191 };
+
+static bool valid_color_mode(const string& mode)
+{
+    return mode == "auto" || mode == "always" || mode == "never";
+}
+
+static bool should_use_color(const string& color_mode, bool out_is_tty)
+{
+    if (color_mode == "never") return false;
+    if (color_mode == "always") return true;
+    if (color_mode != "auto") return false;
+#ifdef _WIN32
+    char buf[16];
+    if (GetEnvironmentVariableA("NO_COLOR", buf, sizeof(buf)) > 0) return false;
+#else
+    const char* no_color = getenv("NO_COLOR");
+    if (no_color && no_color[0] != '\0') return false;
+#endif
+    return out_is_tty;
+}
+
+static string highlight_tickets(const string& text)
+{
+    if (text.find("[[") == string::npos) return text;
+    static const regex ph(R"RX(\[\[[A-Z][A-Z0-9_]*_\d+\]\])RX");
+    static const char* STAMP_RED_ON = "\x1b[1;38;2;255;106;77m";
+    static const char* ANSI_RESET = "\x1b[0m";
+    string out;
+    size_t last = 0;
+    for (auto it = sregex_iterator(text.begin(), text.end(), ph);
+         it != sregex_iterator(); ++it)
+    {
+        size_t pos = (size_t)it->position(0);
+        size_t len = (size_t)it->length(0);
+        out.append(text, last, pos - last);
+        out.append(STAMP_RED_ON);
+        out.append(text, pos, len);
+        out.append(ANSI_RESET);
+        last = pos + len;
+    }
+    if (last == 0) return text;
+    out.append(text, last, string::npos);
+    return out;
+}
+
+static bool confirm_redaction(
+    size_t count,
+    const vector<string>& tickets,
+    istream* in_stream,
+    ostream& err_stream,
+    bool use_console_tty = false)
+{
+    if (count == 0) return true;
+    if (!tickets.empty())
+    {
+        err_stream << "prosze: " << count << " item(s) to redact (";
+        for (size_t i = 0; i < tickets.size(); ++i)
+        {
+            if (i > 0) err_stream << ", ";
+            err_stream << tickets[i];
+        }
+        err_stream << ")\n";
+    }
+    else
+    {
+        err_stream << "prosze: " << count << " item(s) to redact\n";
+    }
+    err_stream << "Approve redaction? [y/N]: " << flush;
+
+    string answer;
+    if (in_stream != nullptr)
+    {
+        if (!getline(*in_stream, answer)) return false;
+    }
+    else if (use_console_tty)
+    {
+#ifdef _WIN32
+        const char* tty_path = "CONIN$";
+#else
+        const char* tty_path = "/dev/tty";
+#endif
+        FILE* tty = fopen(tty_path, "r");
+        if (!tty) return false;
+        char buf[256];
+        bool ok = (fgets(buf, sizeof(buf), tty) != nullptr);
+        fclose(tty);
+        if (!ok) return false;
+        answer = buf;
+    }
+    else
+    {
+        if (!getline(cin, answer)) return false;
+    }
+
+    string norm = lower(trim(answer));
+    return norm == "y" || norm == "yes";
+}
+
 struct Rule
 {
     string cat;
@@ -1520,7 +1639,7 @@ public:
         return auto_names(t);                                       // names nobody listed
     }
 
-    void redact_stream(istream& in, ostream& out, size_t chunk_size = 65536)
+    void redact_stream(istream& in, ostream& out, size_t chunk_size = 65536, bool color = false)
     {
         if (chunk_size == 0) chunk_size = 65536;
         static constexpr size_t BEGIN_BLOCK_CAP = 65536;
@@ -1537,7 +1656,8 @@ public:
             buffer.erase(0, count);
             string safe = redact(prefix);
             all_fresh.insert(all_fresh.end(), fresh.begin(), fresh.end());
-            out.write(safe.data(), (streamsize)safe.size());
+            string rendered = color ? highlight_tickets(safe) : safe;
+            out.write(rendered.data(), (streamsize)rendered.size());
         };
 
         while (true)
@@ -2345,6 +2465,8 @@ static int usage()
             "  --passphrase KEY    encrypt mapping file with KEY (or PROSZE_KEY env)\n"
             "  --strict-restore    only restore placeholders redacted during this session\n"
             "  --stream            stream stdin/stdout in chunks\n"
+            "  --color MODE        highlight tickets: auto (default) | always | never\n"
+            "  --confirm           prompt on stderr for approval before emitting or running\n"
             "  --names LEVEL       automatic name finder: off | strict | normal (default) | aggressive\n"
             "  --explain           print what was hidden (placeholder = real value) to stderr\n";
     return 2;
@@ -2399,8 +2521,8 @@ int main(int argc, char** argv)
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
     const string mode = selected_mode(argc, argv);
-    string map_path = ".prosze-map", names = "normal", passphrase = "";
-    bool explain = false, ephemeral = false, strict_restore = false, stream = false;
+    string map_path = ".prosze-map", names = "normal", passphrase = "", color_mode = "auto";
+    bool explain = false, ephemeral = false, strict_restore = false, stream = false, confirm = false;
     vector<string> envs, terms, term_files, cmd;
 
     for (int i = 2; i < argc; ++i)
@@ -2412,6 +2534,8 @@ int main(int argc, char** argv)
         else if (a == "--term") terms.push_back(next());
         else if (a == "--terms") term_files.push_back(next());
         else if (a == "--names") names = next();
+        else if (a == "--color") color_mode = next();
+        else if (a == "--confirm") confirm = true;
         else if (a == "--explain") explain = true;
         else if (a == "--ephemeral") ephemeral = true;
         else if (a == "--passphrase") passphrase = next();
@@ -2422,6 +2546,37 @@ int main(int argc, char** argv)
     }
     if (mode != "chat" && mode != "redact" && mode != "restore" && mode != "check" && mode != "run")
         return usage();
+    if (!valid_color_mode(color_mode))
+    {
+        cerr << "prosze: --color must be auto, always or never\n";
+        return 2;
+    }
+
+#ifdef _WIN32
+    bool stdout_is_tty = isatty(_fileno(stdout)) != 0;
+    bool stdin_is_tty = isatty(_fileno(stdin)) != 0;
+#else
+    bool stdout_is_tty = isatty(STDOUT_FILENO) != 0;
+    bool stdin_is_tty = isatty(STDIN_FILENO) != 0;
+#endif
+    bool use_color = should_use_color(color_mode, stdout_is_tty);
+#ifdef _WIN32
+    if (use_color && stdout_is_tty)
+    {
+        HANDLE h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (h_out != nullptr && h_out != INVALID_HANDLE_VALUE)
+        {
+            DWORD cmode = 0;
+            if (GetConsoleMode(h_out, &cmode))
+            {
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+                SetConsoleMode(h_out, cmode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+#endif
 
     if (passphrase.empty())
     {
@@ -2451,8 +2606,39 @@ int main(int argc, char** argv)
 
     if (mode == "redact")
     {
-        if (stream) v.redact_stream(cin, cout);
-        else cout << v.redact(slurp_stdin());
+        if (confirm)
+        {
+            string out;
+            if (stream)
+            {
+                ostringstream oss;
+                v.redact_stream(cin, oss);
+                out = oss.str();
+            }
+            else
+            {
+                out = v.redact(slurp_stdin());
+            }
+            if (v.hits > 0)
+            {
+                vector<string> tickets(v.session_keys.begin(), v.session_keys.end());
+                if (!confirm_redaction(v.hits, tickets, nullptr, cerr, true))
+                {
+                    cerr << "prosze: aborted by user\n";
+                    return 1;
+                }
+            }
+            cout << (use_color ? highlight_tickets(out) : out);
+        }
+        else if (stream)
+        {
+            v.redact_stream(cin, cout, 65536, use_color);
+        }
+        else
+        {
+            string out = v.redact(slurp_stdin());
+            cout << (use_color ? highlight_tickets(out) : out);
+        }
         if (explain) v.print_fresh(cerr);
         if (v.dirty && !v.save_map(map_path)) { cerr << "prosze: cannot write map\n"; return 1; }
         cerr << "prosze: " << v.hits << " item(s) hidden\n";
@@ -2477,7 +2663,16 @@ int main(int argc, char** argv)
     v.strict_restore = true;
     vector<string> safe_cmd;
     for (auto& c : cmd) safe_cmd.push_back(v.redact(c));           // args can hold secrets too
-    string safe = v.redact(isatty(0) ? string() : slurp_stdin());
+    string safe = v.redact(stdin_is_tty ? string() : slurp_stdin());
+    if (confirm && v.hits > 0)
+    {
+        vector<string> tickets(v.session_keys.begin(), v.session_keys.end());
+        if (!confirm_redaction(v.hits, tickets, stdin_is_tty ? &cin : nullptr, cerr, !stdin_is_tty))
+        {
+            cerr << "prosze: aborted by user\n";
+            return 1;
+        }
+    }
     if (v.dirty && !v.save_map(map_path)) { cerr << "prosze: cannot write map\n"; return 1; }
 
     string reply;
