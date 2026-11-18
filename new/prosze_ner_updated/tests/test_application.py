@@ -1,3 +1,4 @@
+import gzip
 import http.client
 import io
 import json
@@ -1119,8 +1120,10 @@ class ApplicationTests(unittest.TestCase):
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Encoding", "gzip")
                     self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
                     self.end_headers()
                     self.wfile.write(body)
+                    self.close_connection = True
                     return
 
                 body = b'{"ok":true}'
@@ -1212,6 +1215,55 @@ class ApplicationTests(unittest.TestCase):
             d_resp.read()
             conn.close()
             self.assertEqual(d_resp.status, 502)
+
+            # 7. Compressed request Content-Encoding (gzip / multi-coding) -> 415 Unsupported Media Type (upstream untouched)
+            hits_before_415 = upstream_hits
+            gz_payload = gzip.compress(b'{"prompt":"secret alice@example.com"}')
+            for bad_ce in ("gzip", "gzip, identity"):
+                conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/identity",
+                    body=gz_payload,
+                    headers={"Content-Type": "application/json", "Content-Encoding": bad_ce},
+                )
+                gz_resp = conn.getresponse()
+                gz_resp.read()
+                conn.close()
+                self.assertEqual(gz_resp.status, 415)
+            self.assertEqual(upstream_hits, hits_before_415)
+
+            # Request with Content-Encoding: identity is allowed -> 200 OK
+            conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+            conn.request(
+                "POST",
+                "/identity",
+                body=b'{"x":1}',
+                headers={"Content-Type": "application/json", "Content-Encoding": "identity"},
+            )
+            id_req_resp = conn.getresponse()
+            id_req_resp.read()
+            conn.close()
+            self.assertEqual(id_req_resp.status, 200)
+
+            # 8. Multi-coding Transfer-Encoding (gzip, chunked) -> 400 Bad Request (upstream untouched)
+            hits_before_te = upstream_hits
+            gz_chunk = gzip.compress(b"secret alice@example.com")
+            with socket.create_connection((b_host, b_port), timeout=5) as sock:
+                raw_te_req = (
+                    b"POST /identity HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Transfer-Encoding: gzip, chunked\r\n"
+                    b"Connection: close\r\n\r\n"
+                    + f"{len(gz_chunk):x}\r\n".encode("ascii")
+                    + gz_chunk
+                    + b"\r\n0\r\n\r\n"
+                )
+                sock.sendall(raw_te_req)
+                raw_te_resp = sock.recv(4096).decode("utf-8", "replace")
+            self.assertTrue(raw_te_resp.startswith("HTTP/1.1 400 ") or raw_te_resp.startswith("HTTP/1.0 400 "))
+            self.assertEqual(upstream_hits, hits_before_te)
 
     def test_cli_broker_serve_help_and_dispatch(self):
         command = [sys.executable, "-m", "prosze_cli"]

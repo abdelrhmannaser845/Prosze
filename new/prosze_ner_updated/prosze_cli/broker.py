@@ -509,7 +509,7 @@ class BrokerRequestHandler(BaseHTTPRequestHandler):
                 for tok in raw_te.split(",")
                 if tok.strip()
             ]
-            if not codings or codings[-1] != "chunked":
+            if codings != ["chunked"]:
                 return None, 400, "Unsupported Transfer-Encoding"
             return self._read_chunked_body()
 
@@ -627,8 +627,8 @@ class BrokerRequestHandler(BaseHTTPRequestHandler):
         )
 
     @staticmethod
-    def _has_compressed_encoding(up_resp: http.client.HTTPResponse) -> bool:
-        ce_vals = up_resp.headers.get_all("Content-Encoding") or []
+    def _has_compressed_encoding(headers: Any) -> bool:
+        ce_vals = headers.get_all("Content-Encoding") or []
         encodings = [
             tok.strip().lower()
             for val in ce_vals
@@ -713,6 +713,11 @@ class BrokerRequestHandler(BaseHTTPRequestHandler):
             return
 
         assert raw_body is not None
+        if self._has_compressed_encoding(self.headers):
+            self._send_error_json(415, "Unsupported Content-Encoding; only identity is allowed")
+            finish(415)
+            return
+
         req_ct = self.headers.get("Content-Type", "")
         forwarded_body, redacted_count = self._redact_request_body(raw_body, req_ct)
 
@@ -739,7 +744,7 @@ class BrokerRequestHandler(BaseHTTPRequestHandler):
             )
             up_resp = conn.getresponse()
 
-            if self._has_compressed_encoding(up_resp):
+            if self._has_compressed_encoding(up_resp.headers):
                 self._send_error_json(502, "Upstream returned compressed Content-Encoding")
                 finish(502)
                 return
