@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -595,6 +596,107 @@ class ApplicationTests(unittest.TestCase):
             self.assertIn("[[CUSTOMER_1]]", safe)
             self.assertIn("[[ENV_1]]", safe)
             self.assertLess(elapsed_ms, 500.0)
+
+    def test_stream_redact_and_restore_chunk_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            v.add_term("CUSTOMER=Acme Corp")
+
+            key_block = (
+                "-----BEGIN PRIVATE KEY-----\n"
+                "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+                "0123456789abcdef0123456789abcdef0123456789abcdef\n"
+                "-----END PRIVATE KEY-----\n"
+            )
+            raw = (
+                "012345678901234567890123 alice.smith@example.com\n"
+                "01234567890123456789012345 Acme Corp\n"
+                "0123456789012345678901234 sk-proj-abcdef1234567890\n"
+                + key_block
+                + "Trailing 01234567890123456789 bob.jones@example.org end."
+            )
+
+            out_buf = io.StringIO()
+            total_hits = v.redact_stream(io.StringIO(raw), out_buf, chunk_size=32)
+            safe = out_buf.getvalue()
+
+            self.assertEqual(total_hits, 5)
+            self.assertNotIn("alice.smith@example.com", safe)
+            self.assertNotIn("Acme Corp", safe)
+            self.assertNotIn("sk-proj-abcdef1234567890", safe)
+            self.assertNotIn("MIIBVQIBADANBgkqhkiG9w0BAQEFAASC", safe)
+            self.assertNotIn("bob.jones@example.org", safe)
+            self.assertIn("[[EMAIL_1]]", safe)
+            self.assertIn("[[CUSTOMER_1]]", safe)
+            self.assertIn("[[TOKEN_1]]", safe)
+            self.assertIn("[[PRIVKEY_1]]", safe)
+            self.assertIn("[[EMAIL_2]]", safe)
+
+            # Restore with "[[" split across 32-byte boundary (both '['|'[' and mid-placeholder)
+            restored_out = io.StringIO()
+            padded = "0123456789012345678901234567890[[CUSTOMER_1]] 0123456789012345[[CUSTOMER_1]] " + safe
+            v.restore_stream(io.StringIO(padded), restored_out, chunk_size=32)
+            self.assertEqual(
+                restored_out.getvalue(),
+                "0123456789012345678901234567890Acme Corp 0123456789012345Acme Corp " + raw,
+            )
+
+            # Binary streams with multi-byte UTF-8 across chunk boundary
+            utf8_raw = ("Łódź — prefix 0123456789012345 alice.smith@example.com end").encode("utf-8")
+            bin_safe = io.BytesIO()
+            hits_bin = v.redact_stream(io.BytesIO(utf8_raw), bin_safe, chunk_size=32)
+            self.assertEqual(hits_bin, 1)
+            self.assertIn(b"[[EMAIL_1]]", bin_safe.getvalue())
+            bin_restored = io.BytesIO()
+            v.restore_stream(io.BytesIO(bin_safe.getvalue()), bin_restored, chunk_size=32)
+            self.assertEqual(bin_restored.getvalue(), utf8_raw)
+
+            # Unclosed "-----BEGIN " cap (> 64 KB) still completes and redacts trailing email
+            bogus_payload = "-----BEGIN PRIVATE KEY-----\n" + ("A" * 64 + "\n") * 1150 + "tail mail@example.com"
+            v2 = Vault(str(Path(directory) / "cap_map.tsv"))
+            v2._ner_attempted = True
+            cap_out = io.StringIO()
+            cap_hits = v2.redact_stream(io.StringIO(bogus_payload), cap_out, chunk_size=4096)
+            self.assertGreaterEqual(cap_hits, 1)
+            self.assertIn("[[EMAIL_1]]", cap_out.getvalue())
+            self.assertNotIn("mail@example.com", cap_out.getvalue())
+
+    def test_cli_stream_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            map_path = Path(directory) / "map.tsv"
+            command = [sys.executable, "-m", "prosze_cli"]
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(PACKAGE_DIR)
+
+            payload = (
+                "012345678901234567890123 alice.smith@example.com\n"
+                "Please contact Acme Corp.\n"
+            )
+            redact_res = subprocess.run(
+                command + ["redact", "--stream", "--no-ner", "--map", str(map_path), "--term", "CUSTOMER=Acme Corp"],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input=payload,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(redact_res.returncode, 0)
+            self.assertIn("[[EMAIL_1]]", redact_res.stdout)
+            self.assertIn("[[CUSTOMER_1]]", redact_res.stdout)
+            self.assertIn("2 item(s) hidden", redact_res.stderr)
+
+            restore_res = subprocess.run(
+                command + ["restore", "--stream", "--no-ner", "--map", str(map_path)],
+                cwd=PACKAGE_DIR,
+                env=env,
+                input=redact_res.stdout,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(restore_res.returncode, 0)
+            self.assertEqual(restore_res.stdout, payload)
 
 
 if __name__ == "__main__":

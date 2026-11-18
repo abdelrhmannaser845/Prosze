@@ -60,12 +60,99 @@ static vector<string> process_exit_command()
 #endif
 }
 
+static vector<string> exact_pipe_reader_command()
+{
+#ifdef _WIN32
+    char exe_path[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+    assert(len > 0 && len < MAX_PATH);
+    return { string(exe_path), "--cat-helper" };
+#else
+    return { "/bin/cat" };
+#endif
+}
+
+struct ScopedEnvVar
+{
+    string name;
+    bool had_value = false;
+    string old_value;
+
+    ScopedEnvVar(const char* n, const string& val) : name(n)
+    {
+#ifdef _WIN32
+        char buf[32768];
+        DWORD len = GetEnvironmentVariableA(name.c_str(), buf, sizeof(buf));
+        if (len > 0 && len < sizeof(buf))
+        {
+            had_value = true;
+            old_value.assign(buf, len);
+        }
+        SetEnvironmentVariableA(name.c_str(), val.c_str());
+#else
+        const char* cur = getenv(name.c_str());
+        if (cur)
+        {
+            had_value = true;
+            old_value = cur;
+        }
+        setenv(name.c_str(), val.c_str(), 1);
+#endif
+    }
+
+    ~ScopedEnvVar()
+    {
+#ifdef _WIN32
+        SetEnvironmentVariableA(name.c_str(), had_value ? old_value.c_str() : nullptr);
+#else
+        if (had_value) setenv(name.c_str(), old_value.c_str(), 1);
+        else unsetenv(name.c_str());
+#endif
+    }
+};
+
 static void test_native_process_execution()
 {
     string output;
     assert(run_command(process_reader_command(), "safe child input\n", output) == 0);
-    assert(output == "safe child input\n" || output == "safe child input\r\n");
+    assert(output == "safe child input\n" || output == "safe child input\r\n" || output == "safe child input\r\n\r\n");
     assert(run_command(process_exit_command(), "", output) == 7);
+}
+
+static void test_run_command_large_pipe_zero_temp_files()
+{
+    fs::path sandbox_tmp = test_path("pipe_sandbox");
+    if (fs::exists(sandbox_tmp)) fs::remove_all(sandbox_tmp);
+    fs::create_directories(sandbox_tmp);
+
+    string payload;
+    payload.reserve(200 * 1024);
+    for (int i = 0; i < 4000; ++i)
+    {
+        payload += "line " + to_string(i) + ": safe piped payload segment 0123456789abcdef\n";
+    }
+    assert(payload.size() > 128 * 1024);
+
+    {
+        ScopedEnvVar guard_tmp("TMP", sandbox_tmp.string());
+        ScopedEnvVar guard_temp("TEMP", sandbox_tmp.string());
+        ScopedEnvVar guard_tmpdir("TMPDIR", sandbox_tmp.string());
+
+        string output = "stale-data";
+        int rc = run_command(exact_pipe_reader_command(), payload, output);
+        assert(rc == 0);
+        assert(output.size() == payload.size());
+        assert(output == payload);
+        assert(fs::is_empty(sandbox_tmp));
+
+        // Early child exit with >128 KB stdin must not deadlock or crash on SIGPIPE
+        string exit_out = "stale";
+        assert(run_command(process_exit_command(), payload, exit_out) == 7);
+        assert(exit_out.empty());
+        assert(fs::is_empty(sandbox_tmp));
+    }
+
+    fs::remove_all(sandbox_tmp);
 }
 
 static void test_bare_invocation_selects_chat()
@@ -466,11 +553,97 @@ static void test_50kb_throughput()
     assert(elapsed_ms < 500.0);
 }
 
-int main()
+static void test_streaming_redaction_and_restoration()
 {
+    prosze v;
+    v.name_level = 0;
+    v.add_term("CUSTOMER=Acme Corp");
+
+    // Craft payload where tokens, emails, terms, and a private key block cross 32-byte chunk boundaries
+    string key_block =
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "0123456789abcdef0123456789abcdef0123456789abcdef\n"
+        "-----END PRIVATE KEY-----\n";
+
+    // Pad prefixes so secrets/emails/terms intentionally straddle 32-byte boundaries (32, 64, 96...)
+    string raw =
+        "012345678901234567890123 alice.smith@example.com\n"
+        "01234567890123456789012345 Acme Corp\n"
+        "0123456789012345678901234 sk-proj-abcdef1234567890\n"
+        + key_block +
+        "Trailing 01234567890123456789 bob.jones@example.org end.";
+
+    istringstream in(raw);
+    ostringstream out;
+    v.redact_stream(in, out, 32);
+    string safe = out.str();
+
+    assert(safe.find("alice.smith@example.com") == string::npos);
+    assert(safe.find("Acme Corp") == string::npos);
+    assert(safe.find("sk-proj-abcdef1234567890") == string::npos);
+    assert(safe.find("MIIBVQIBADANBgkqhkiG9w0BAQEFAASC") == string::npos);
+    assert(safe.find("bob.jones@example.org") == string::npos);
+    assert(safe.find("[[EMAIL_1]]") != string::npos);
+    assert(safe.find("[[CUSTOMER_1]]") != string::npos);
+    assert(safe.find("[[TOKEN_1]]") != string::npos);
+    assert(safe.find("[[PRIVKEY_1]]") != string::npos);
+    assert(safe.find("[[EMAIL_2]]") != string::npos);
+    assert(v.hits == 5);
+    assert(v.dirty);
+    assert(v.fresh.size() == 5);
+
+    // Restore stream with chunk_size = 32, also testing a single '[' right at a 32-byte boundary
+    string padded_for_split = "0123456789012345678901234567890[[CUSTOMER_1]] " + safe;
+    istringstream rin(padded_for_split);
+    ostringstream rout;
+    v.restore_stream(rin, rout, 32);
+    assert(rout.str() == "0123456789012345678901234567890Acme Corp " + raw);
+
+    // Also test placeholder split right in the middle of "[[CUSTOMER_1]]" across 32-byte boundary
+    string split_ph = "01234567890123456789012345[[CUSTOMER_1]] end";
+    istringstream rin2(split_ph);
+    ostringstream rout2;
+    v.restore_stream(rin2, rout2, 32);
+    assert(rout2.str() == "01234567890123456789012345Acme Corp end");
+
+    // Verify unclosed "-----BEGIN " cap (> 64 KB) does not hang or retain unbounded memory
+    string bogus_key_head = "-----BEGIN PRIVATE KEY-----\n";
+    string bogus_payload = bogus_key_head;
+    while (bogus_payload.size() < 72 * 1024)
+    {
+        bogus_payload += "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+    }
+    bogus_payload += "afterwards mail@example.com";
+    prosze v2;
+    v2.name_level = 0;
+    istringstream bin(bogus_payload);
+    ostringstream bout;
+    v2.redact_stream(bin, bout, 4096);
+    assert(bout.str().find("[[EMAIL_1]]") != string::npos);
+    assert(bout.str().find("mail@example.com") == string::npos);
+}
+
+int main(int argc, char** argv)
+{
+    if (argc >= 2 && string(argv[1]) == "--cat-helper")
+    {
+#ifdef _WIN32
+        _setmode(_fileno(stdin), _O_BINARY);
+        _setmode(_fileno(stdout), _O_BINARY);
+#endif
+        char buf[16384];
+        while (cin.read(buf, sizeof(buf)) || cin.gcount() > 0)
+        {
+            cout.write(buf, cin.gcount());
+        }
+        cout.flush();
+        return 0;
+    }
     test_redaction_and_restoration();
     test_env_and_tsv_map_compatibility();
     test_native_process_execution();
+    test_run_command_large_pipe_zero_temp_files();
     test_bare_invocation_selects_chat();
     test_ephemeral_vault_persistence();
     test_encrypted_vault_persistence_and_auth_failure();
@@ -481,5 +654,6 @@ int main()
     test_aho_corasick_literals_terms_and_placeholder_immunity();
     test_prefilter_accuracy_and_zero_match_fast_path();
     test_50kb_throughput();
+    test_streaming_redaction_and_restoration();
     return 0;
 }

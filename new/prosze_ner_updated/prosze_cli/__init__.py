@@ -32,6 +32,7 @@ def build_common_parser() -> argparse.ArgumentParser:
     p.add_argument("--ephemeral", action="store_true", help="keep mapping in memory only, never write to disk")
     p.add_argument("--passphrase", default=None, metavar="KEY", help="encrypt mapping file with KEY (or PROSZE_KEY env)")
     p.add_argument("--strict-restore", action="store_true", help="only restore placeholders redacted during this session")
+    p.add_argument("--stream", action="store_true", help="stream stdin/stdout in chunks")
     return p
 
 
@@ -63,14 +64,20 @@ def cmd_chat(v: Vault) -> None:
     _chat(v)
 
 
-def cmd_redact(v: Vault) -> None:
-    safe, n = v.redact(read_stdin())
-    sys.stdout.buffer.write(safe.encode("utf-8"))
+def cmd_redact(v: Vault, stream: bool = False) -> None:
+    if stream:
+        n = v.redact_stream(sys.stdin.buffer, sys.stdout.buffer)
+    else:
+        safe, n = v.redact(read_stdin())
+        sys.stdout.buffer.write(safe.encode("utf-8"))
     sys.stderr.write(f"prosze: {n} item(s) hidden\n")
 
 
-def cmd_restore(v: Vault) -> None:
-    sys.stdout.buffer.write(v.restore(read_stdin()).encode("utf-8"))
+def cmd_restore(v: Vault, stream: bool = False) -> None:
+    if stream:
+        v.restore_stream(sys.stdin.buffer, sys.stdout.buffer)
+    else:
+        sys.stdout.buffer.write(v.restore(read_stdin()).encode("utf-8"))
 
 
 def cmd_check(v: Vault) -> None:
@@ -140,9 +147,9 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
     if a.cmd == "chat":
         cmd_chat(v)
     elif a.cmd == "redact":
-        cmd_redact(v)
+        cmd_redact(v, stream=getattr(a, "stream", False))
     elif a.cmd == "restore":
-        cmd_restore(v)
+        cmd_restore(v, stream=getattr(a, "stream", False))
     elif a.cmd == "check":
         cmd_check(v)
     elif a.cmd == "run":

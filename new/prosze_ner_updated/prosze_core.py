@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import base64
 import bisect
+import codecs
 from collections import deque
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -411,6 +413,37 @@ def decrypt_map(passphrase: Optional[str], line: str) -> str:
         raise ValueError("prosze: invalid passphrase or corrupted encrypted map")
 
 
+def _is_binary_stream(stream) -> bool:
+    return isinstance(stream, (io.RawIOBase, io.BufferedIOBase)) or "b" in str(getattr(stream, "mode", ""))
+
+
+def _write_stream_text(out_stream, text: str, binary_out: bool) -> None:
+    if not text:
+        return
+    out_stream.write(text.encode("utf-8") if binary_out else text)
+
+
+def _iter_stream_chunks(in_stream, chunk_size: int):
+    decoder = None
+    while True:
+        raw = in_stream.read(chunk_size)
+        if not raw:
+            if decoder is not None:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    yield tail, False
+            yield "", True
+            return
+        if isinstance(raw, (bytes, bytearray)):
+            if decoder is None:
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            text = decoder.decode(bytes(raw), final=False)
+            if text:
+                yield text, False
+        else:
+            yield raw, False
+
+
 class Vault:
     def __init__(self, map_path: str, ephemeral: bool = False, passphrase: Optional[str] = None, strict_restore: bool = False):
         self.map_path = map_path
@@ -674,6 +707,115 @@ class Vault:
                 return k
             return json.dumps(v, ensure_ascii=False)[1:-1] if json_escaped else v
         return PH.sub(sub, text)
+
+    def redact_stream(self, in_stream, out_stream, chunk_size: int = 65536) -> int:
+        """Stream-redact in_stream to out_stream using a sliding window."""
+        if chunk_size <= 0:
+            chunk_size = 65536
+        begin_block_cap = 65536
+        ws_window = 4096
+        max_unsplit = max(chunk_size, begin_block_cap)
+        binary_out = _is_binary_stream(out_stream)
+
+        total_hits = 0
+        buf = ""
+
+        def flush_prefix(count: int) -> None:
+            nonlocal buf, total_hits
+            if count <= 0:
+                return
+            prefix = buf[:count]
+            buf = buf[count:]
+            safe, n = self.redact(prefix)
+            total_hits += n
+            _write_stream_text(out_stream, safe, binary_out)
+
+        for chunk, at_eof in _iter_stream_chunks(in_stream, chunk_size):
+            if chunk:
+                buf += chunk
+            if at_eof:
+                if buf:
+                    flush_prefix(len(buf))
+                break
+            if not buf:
+                continue
+
+            last_begin = buf.rfind("-----BEGIN ")
+            min_block_end = 0
+            if last_begin != -1:
+                end_pos = buf.find("-----END ", last_begin + 11)
+                end_close = buf.find("-----", end_pos + 9) if end_pos != -1 else -1
+                if end_close == -1:
+                    if (len(buf) - last_begin) < begin_block_cap:
+                        continue
+                else:
+                    min_block_end = end_close + 5
+
+            split: Optional[int] = None
+            nl = buf.rfind("\n")
+            if nl != -1 and (len(buf) - (nl + 1)) <= ws_window and (nl + 1) >= min_block_end:
+                split = nl + 1
+            else:
+                win_start = max(min_block_end, len(buf) - ws_window)
+                for idx in range(len(buf) - 1, win_start - 1, -1):
+                    if buf[idx] in (" ", "\t", "\r", "\n"):
+                        split = idx + 1
+                        break
+                if split is None and nl != -1 and (nl + 1) >= min_block_end:
+                    split = nl + 1
+
+            if split is None:
+                block_len = (len(buf) - last_begin) if last_begin != -1 else len(buf)
+                if block_len >= max_unsplit or len(buf) >= max_unsplit * 2:
+                    split = len(buf)
+                else:
+                    continue
+
+            flush_prefix(split)
+
+        if hasattr(out_stream, "flush"):
+            out_stream.flush()
+        return total_hits
+
+    def restore_stream(self, in_stream, out_stream, chunk_size: int = 65536) -> None:
+        """Stream-restore in_stream to out_stream, holding back split placeholders."""
+        if chunk_size <= 0:
+            chunk_size = 65536
+        hold_window = 64
+        binary_out = _is_binary_stream(out_stream)
+        buf = ""
+
+        def flush_prefix(count: int) -> None:
+            nonlocal buf
+            if count <= 0:
+                return
+            prefix = buf[:count]
+            buf = buf[count:]
+            _write_stream_text(out_stream, self.restore(prefix), binary_out)
+
+        for chunk, at_eof in _iter_stream_chunks(in_stream, chunk_size):
+            if chunk:
+                buf += chunk
+            if at_eof:
+                if buf:
+                    flush_prefix(len(buf))
+                break
+            if not buf:
+                continue
+
+            win_start = max(0, len(buf) - hold_window)
+            open_pos = buf.rfind("[[")
+            hold_from = len(buf)
+            if open_pos != -1 and open_pos >= win_start:
+                if buf.find("]]", open_pos + 2) == -1:
+                    hold_from = open_pos
+            if hold_from == len(buf) and buf.endswith("["):
+                hold_from = len(buf) - 1
+
+            flush_prefix(hold_from)
+
+        if hasattr(out_stream, "flush"):
+            out_stream.flush()
 
     # -- map file (same TSV format as the C++ prosze, mode 0600)
     def _persist(self):

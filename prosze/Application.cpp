@@ -55,6 +55,8 @@
   #define pclose _pclose
   #define isatty _isatty
 #else
+  #include <cerrno>
+  #include <csignal>
   #include <fcntl.h>
   #include <sys/stat.h>
   #include <sys/wait.h>
@@ -76,6 +78,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 using namespace std;
 
@@ -1517,6 +1520,95 @@ public:
         return auto_names(t);                                       // names nobody listed
     }
 
+    void redact_stream(istream& in, ostream& out, size_t chunk_size = 65536)
+    {
+        if (chunk_size == 0) chunk_size = 65536;
+        static constexpr size_t BEGIN_BLOCK_CAP = 65536;
+        static constexpr size_t WS_WINDOW = 4096;
+        const size_t max_unsplit = max(chunk_size, BEGIN_BLOCK_CAP);
+
+        vector<char> tmp(chunk_size);
+        vector<pair<string, string>> all_fresh;
+        string buffer;
+
+        auto flush_prefix = [&](size_t count) {
+            if (count == 0) return;
+            string prefix = buffer.substr(0, count);
+            buffer.erase(0, count);
+            string safe = redact(prefix);
+            all_fresh.insert(all_fresh.end(), fresh.begin(), fresh.end());
+            out.write(safe.data(), (streamsize)safe.size());
+        };
+
+        while (true)
+        {
+            in.read(tmp.data(), (streamsize)chunk_size);
+            streamsize got = in.gcount();
+            if (got > 0) buffer.append(tmp.data(), (size_t)got);
+            bool at_eof = !in || in.eof();
+
+            if (at_eof)
+            {
+                if (!buffer.empty()) flush_prefix(buffer.size());
+                break;
+            }
+            if (buffer.empty()) continue;
+
+            // Keep buffering while an unclosed "-----BEGIN " block is open (up to 64 KB cap)
+            size_t last_begin = buffer.rfind("-----BEGIN ");
+            size_t min_block_end = 0;
+            if (last_begin != string::npos)
+            {
+                size_t end_pos = buffer.find("-----END ", last_begin + 11);
+                size_t end_close = (end_pos != string::npos) ? buffer.find("-----", end_pos + 9) : string::npos;
+                if (end_close == string::npos)
+                {
+                    if ((buffer.size() - last_begin) < BEGIN_BLOCK_CAP)
+                        continue;
+                }
+                else
+                {
+                    min_block_end = end_close + 5;
+                }
+            }
+
+            size_t split = string::npos;
+            size_t nl = buffer.rfind('\n');
+            if (nl != string::npos && (buffer.size() - (nl + 1)) <= WS_WINDOW && (nl + 1) >= min_block_end)
+            {
+                split = nl + 1;
+            }
+            else
+            {
+                size_t win_start = buffer.size() > WS_WINDOW ? buffer.size() - WS_WINDOW : 0;
+                if (win_start < min_block_end) win_start = min_block_end;
+                for (size_t i = buffer.size(); i > win_start; --i)
+                {
+                    unsigned char c = (unsigned char)buffer[i - 1];
+                    if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+                    {
+                        split = i;
+                        break;
+                    }
+                }
+                if (split == string::npos && nl != string::npos && (nl + 1) >= min_block_end)
+                    split = nl + 1;
+            }
+
+            if (split == string::npos)
+            {
+                size_t block_len = (last_begin != string::npos) ? (buffer.size() - last_begin) : buffer.size();
+                if (block_len >= max_unsplit || buffer.size() >= max_unsplit * 2) split = buffer.size();
+                else continue;
+            }
+
+            flush_prefix(split);
+        }
+
+        fresh = move(all_fresh);
+        out.flush();
+    }
+
     bool set_level(const string& s)
     {
         if (s == "off") name_level = 0;
@@ -1566,6 +1658,53 @@ public:
         }
         out.append(input, last, string::npos);
         return out;
+    }
+
+    void restore_stream(istream& in, ostream& out, size_t chunk_size = 65536) const
+    {
+        if (chunk_size == 0) chunk_size = 65536;
+        static constexpr size_t HOLD_WINDOW = 64;
+
+        vector<char> tmp(chunk_size);
+        string buffer;
+
+        auto flush_prefix = [&](size_t count) {
+            if (count == 0) return;
+            string prefix = buffer.substr(0, count);
+            buffer.erase(0, count);
+            string restored = restore(prefix);
+            out.write(restored.data(), (streamsize)restored.size());
+        };
+
+        while (true)
+        {
+            in.read(tmp.data(), (streamsize)chunk_size);
+            streamsize got = in.gcount();
+            if (got > 0) buffer.append(tmp.data(), (size_t)got);
+            bool at_eof = !in || in.eof();
+
+            if (at_eof)
+            {
+                if (!buffer.empty()) flush_prefix(buffer.size());
+                break;
+            }
+            if (buffer.empty()) continue;
+
+            size_t win_start = buffer.size() > HOLD_WINDOW ? buffer.size() - HOLD_WINDOW : 0;
+            size_t open_pos = buffer.rfind("[[");
+            size_t hold_from = buffer.size();
+            if (open_pos != string::npos && open_pos >= win_start)
+            {
+                if (buffer.find("]]", open_pos + 2) == string::npos)
+                    hold_from = open_pos;
+            }
+            if (hold_from == buffer.size() && buffer.back() == '[')
+                hold_from = buffer.size() - 1;
+
+            flush_prefix(hold_from);
+        }
+
+        out.flush();
     }
 
     bool save_map(const string& path) const
@@ -1933,27 +2072,6 @@ static string slurp_stdin()
     return string((istreambuf_iterator<char>(cin)), istreambuf_iterator<char>());
 }
 
-// Writes content to a fresh private temp file; returns its path ("" on error).
-static string make_temp(const string& content)
-{
-#ifdef _WIN32
-    char dir[MAX_PATH], path[MAX_PATH];
-    if (!GetTempPathA(MAX_PATH, dir) || !GetTempFileNameA(dir, "prz", 0, path))
-        return "";
-#else
-    char path[] = "/tmp/prosze-XXXXXX";
-    int fd = mkstemp(path);                 // created 0600
-    if (fd < 0) return "";
-    close(fd);
-#endif
-    FILE* f = fopen(path, "wb");
-    if (!f) return "";
-    bool ok = fwrite(content.data(), 1, content.size(), f) == content.size();
-    fclose(f);
-    if (!ok) { ::remove(path); return ""; }
-    return path;
-}
-
 #ifdef _WIN32
 static string windows_arg(const string& arg)
 {
@@ -1982,102 +2100,224 @@ static string windows_arg(const string& arg)
 #endif
 
 // Run an already-separated argument vector without passing through a shell.
-// Temporary files keep stdin/stdout deadlock-free even for large responses.
+// Anonymous OS pipes with a writer thread keep large stdin/stdout payloads deadlock-free in memory.
 static int run_command(const vector<string>& args, const string& input, string& output)
 {
+    output.clear();
     if (args.empty()) return -1;
-    string input_path = make_temp(input), output_path = make_temp("");
-    if (input_path.empty() || output_path.empty())
-    {
-        if (!input_path.empty()) ::remove(input_path.c_str());
-        if (!output_path.empty()) ::remove(output_path.c_str());
-        return -1;
-    }
 
     int status = -1;
 #ifdef _WIN32
-    SECURITY_ATTRIBUTES inherit = { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
-    HANDLE input_handle = CreateFileA(input_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                      &inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    HANDLE output_handle = CreateFileA(output_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                       &inherit, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (input_handle != INVALID_HANDLE_VALUE && output_handle != INVALID_HANDLE_VALUE)
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
+    HANDLE stdin_read = nullptr, stdin_write = nullptr;
+    HANDLE stdout_read = nullptr, stdout_write = nullptr;
+    if (!CreatePipe(&stdin_read, &stdin_write, &sa, 0) ||
+        !CreatePipe(&stdout_read, &stdout_write, &sa, 0))
     {
-        string command;
-        for (const string& arg : args)
-        {
-            if (!command.empty()) command += ' ';
-            command += windows_arg(arg);
-        }
-        vector<char> mutable_command(command.begin(), command.end());
-        mutable_command.push_back('\0');
-        HANDLE error_handle = GetStdHandle(STD_ERROR_HANDLE);
-        vector<HANDLE> inherited_handles = { input_handle, output_handle };
-        if (error_handle != nullptr && error_handle != INVALID_HANDLE_VALUE)
-            inherited_handles.push_back(error_handle);
-
-        SIZE_T attribute_size = 0;
-        InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
-        vector<unsigned char> attribute_storage(attribute_size);
-        LPPROC_THREAD_ATTRIBUTE_LIST attributes =
-            reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
-        bool attributes_ready = attribute_size != 0 &&
-            InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_size) != FALSE &&
-            UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                      inherited_handles.data(),
-                                      inherited_handles.size() * sizeof(HANDLE), nullptr, nullptr) != FALSE;
-
-        STARTUPINFOEXA startup = {};
-        startup.StartupInfo.cb = sizeof(startup);
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startup.StartupInfo.hStdInput = input_handle;
-        startup.StartupInfo.hStdOutput = output_handle;
-        startup.StartupInfo.hStdError = error_handle;
-        startup.lpAttributeList = attributes_ready ? attributes : nullptr;
-        PROCESS_INFORMATION process = {};
-        DWORD creation_flags = attributes_ready ? EXTENDED_STARTUPINFO_PRESENT : 0;
-        if (CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, TRUE, creation_flags,
-                           nullptr, nullptr, &startup.StartupInfo, &process))
-        {
-            WaitForSingleObject(process.hProcess, INFINITE);
-            DWORD exit_code = 1;
-            GetExitCodeProcess(process.hProcess, &exit_code);
-            status = (int)exit_code;
-            CloseHandle(process.hThread);
-            CloseHandle(process.hProcess);
-        }
-        if (attributes_ready) DeleteProcThreadAttributeList(attributes);
+        if (stdin_read) CloseHandle(stdin_read);
+        if (stdin_write) CloseHandle(stdin_write);
+        if (stdout_read) CloseHandle(stdout_read);
+        if (stdout_write) CloseHandle(stdout_write);
+        return -1;
     }
-    if (input_handle != INVALID_HANDLE_VALUE) CloseHandle(input_handle);
-    if (output_handle != INVALID_HANDLE_VALUE) CloseHandle(output_handle);
+
+    if (!SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0))
+    {
+        CloseHandle(stdin_read);
+        CloseHandle(stdin_write);
+        CloseHandle(stdout_read);
+        CloseHandle(stdout_write);
+        return -1;
+    }
+
+    string command;
+    for (const string& arg : args)
+    {
+        if (!command.empty()) command += ' ';
+        command += windows_arg(arg);
+    }
+    vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+
+    HANDLE error_handle = GetStdHandle(STD_ERROR_HANDLE);
+    vector<HANDLE> inherited_handles = { stdin_read, stdout_write };
+    DWORD err_flags = 0;
+    if (error_handle != nullptr && error_handle != INVALID_HANDLE_VALUE &&
+        GetHandleInformation(error_handle, &err_flags) && (err_flags & HANDLE_FLAG_INHERIT))
+    {
+        inherited_handles.push_back(error_handle);
+    }
+
+    SIZE_T attribute_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
+    vector<unsigned char> attribute_storage(attribute_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attributes =
+        attribute_size ? reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data()) : nullptr;
+    bool attributes_ready = attribute_size != 0 &&
+        InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_size) != FALSE &&
+        UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                  inherited_handles.data(),
+                                  inherited_handles.size() * sizeof(HANDLE), nullptr, nullptr) != FALSE;
+
+    STARTUPINFOEXA startup = {};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = stdin_read;
+    startup.StartupInfo.hStdOutput = stdout_write;
+    startup.StartupInfo.hStdError = error_handle;
+    startup.lpAttributeList = attributes_ready ? attributes : nullptr;
+
+    PROCESS_INFORMATION process = {};
+    DWORD creation_flags = attributes_ready ? EXTENDED_STARTUPINFO_PRESENT : 0;
+    BOOL created = CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, TRUE, creation_flags,
+                                  nullptr, nullptr, &startup.StartupInfo, &process);
+    if (attributes_ready) DeleteProcThreadAttributeList(attributes);
+
+    // Close child-side pipe ends in parent immediately so EOF propagates cleanly
+    CloseHandle(stdin_read);
+    CloseHandle(stdout_write);
+
+    if (!created)
+    {
+        CloseHandle(stdin_write);
+        CloseHandle(stdout_read);
+        return -1;
+    }
+
+    HANDLE writer_pipe = stdin_write;
+    stdin_write = nullptr;
+    thread writer([writer_pipe, &input]() {
+        size_t offset = 0;
+        const size_t chunk = 16384;
+        while (offset < input.size())
+        {
+            DWORD to_write = (DWORD)min(chunk, input.size() - offset);
+            DWORD written = 0;
+            if (!WriteFile(writer_pipe, input.data() + offset, to_write, &written, nullptr) || written == 0)
+                break;
+            offset += written;
+        }
+        CloseHandle(writer_pipe);
+    });
+
+    char buf[16384];
+    DWORD bytes_read = 0;
+    while (ReadFile(stdout_read, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0)
+    {
+        output.append(buf, bytes_read);
+    }
+    CloseHandle(stdout_read);
+
+    writer.join();
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    status = (int)exit_code;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
 #else
+    int stdin_pipe[2] = { -1, -1 };
+    int stdout_pipe[2] = { -1, -1 };
+    if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0)
+    {
+        if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
+        if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
+        if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+        if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
+        return -1;
+    }
+
+    struct sigaction sa_ign = {}, sa_old = {};
+    sa_ign.sa_handler = SIG_IGN;
+    sigemptyset(&sa_ign.sa_mask);
+    bool sig_saved = (sigaction(SIGPIPE, &sa_ign, &sa_old) == 0);
+
     pid_t child = fork();
+    if (child < 0)
+    {
+        close(stdin_pipe[0]);
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        if (sig_saved) sigaction(SIGPIPE, &sa_old, nullptr);
+        return -1;
+    }
     if (child == 0)
     {
-        int in = open(input_path.c_str(), O_RDONLY);
-        int out = open(output_path.c_str(), O_WRONLY | O_TRUNC);
-        if (in < 0 || out < 0) _exit(127);
-        dup2(in, STDIN_FILENO);
-        dup2(out, STDOUT_FILENO);
-        close(in);
-        close(out);
+        if (sig_saved) sigaction(SIGPIPE, &sa_old, nullptr);
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        if (dup2(stdin_pipe[0], STDIN_FILENO) < 0 || dup2(stdout_pipe[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        if (stdin_pipe[0] != STDIN_FILENO) close(stdin_pipe[0]);
+        if (stdout_pipe[1] != STDOUT_FILENO) close(stdout_pipe[1]);
         vector<char*> argv;
         for (const string& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
         argv.push_back(nullptr);
         execvp(argv[0], argv.data());
         _exit(127);
     }
-    if (child > 0 && waitpid(child, &status, 0) >= 0)
+
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    int write_fd = stdin_pipe[1];
+    thread writer([write_fd, &input]() {
+        size_t offset = 0;
+        const size_t chunk = 16384;
+        while (offset < input.size())
+        {
+            size_t to_write = min(chunk, input.size() - offset);
+            ssize_t n = write(write_fd, input.data() + offset, to_write);
+            if (n > 0)
+            {
+                offset += (size_t)n;
+            }
+            else if (n < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            else
+            {
+                break;
+            }
+        }
+        close(write_fd);
+    });
+
+    char buf[16384];
+    while (true)
     {
-        if (WIFEXITED(status)) status = WEXITSTATUS(status);
+        ssize_t n = read(stdout_pipe[0], buf, sizeof(buf));
+        if (n > 0)
+        {
+            output.append(buf, (size_t)n);
+        }
+        else if (n == 0)
+        {
+            break;
+        }
+        else if (errno != EINTR)
+        {
+            break;
+        }
+    }
+    close(stdout_pipe[0]);
+
+    writer.join();
+    int raw_status = 0;
+    while (waitpid(child, &raw_status, 0) < 0)
+    {
+        if (errno != EINTR) { raw_status = -1; break; }
+    }
+    if (sig_saved) sigaction(SIGPIPE, &sa_old, nullptr);
+    if (raw_status >= 0)
+    {
+        if (WIFEXITED(raw_status)) status = WEXITSTATUS(raw_status);
         else status = 1;
     }
 #endif
-
-    ifstream in(output_path, ios::binary);
-    output.assign((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
-    ::remove(input_path.c_str());
-    ::remove(output_path.c_str());
     return status;
 }
 
@@ -2104,6 +2344,7 @@ static int usage()
             "  --ephemeral         keep mapping in memory only, never write to disk\n"
             "  --passphrase KEY    encrypt mapping file with KEY (or PROSZE_KEY env)\n"
             "  --strict-restore    only restore placeholders redacted during this session\n"
+            "  --stream            stream stdin/stdout in chunks\n"
             "  --names LEVEL       automatic name finder: off | strict | normal (default) | aggressive\n"
             "  --explain           print what was hidden (placeholder = real value) to stderr\n";
     return 2;
@@ -2159,7 +2400,7 @@ int main(int argc, char** argv)
 #endif
     const string mode = selected_mode(argc, argv);
     string map_path = ".prosze-map", names = "normal", passphrase = "";
-    bool explain = false, ephemeral = false, strict_restore = false;
+    bool explain = false, ephemeral = false, strict_restore = false, stream = false;
     vector<string> envs, terms, term_files, cmd;
 
     for (int i = 2; i < argc; ++i)
@@ -2175,6 +2416,7 @@ int main(int argc, char** argv)
         else if (a == "--ephemeral") ephemeral = true;
         else if (a == "--passphrase") passphrase = next();
         else if (a == "--strict-restore") strict_restore = true;
+        else if (a == "--stream") stream = true;
         else if (a == "--") { for (++i; i < argc; ++i) cmd.push_back(argv[i]); }
         else return usage();
     }
@@ -2209,8 +2451,8 @@ int main(int argc, char** argv)
 
     if (mode == "redact")
     {
-        string safe = v.redact(slurp_stdin());
-        cout << safe;
+        if (stream) v.redact_stream(cin, cout);
+        else cout << v.redact(slurp_stdin());
         if (explain) v.print_fresh(cerr);
         if (v.dirty && !v.save_map(map_path)) { cerr << "prosze: cannot write map\n"; return 1; }
         cerr << "prosze: " << v.hits << " item(s) hidden\n";
@@ -2218,7 +2460,8 @@ int main(int argc, char** argv)
     }
     if (mode == "restore")
     {
-        cout << v.restore(slurp_stdin());
+        if (stream) v.restore_stream(cin, cout);
+        else cout << v.restore(slurp_stdin());
         return 0;
     }
     if (mode == "check")
