@@ -925,18 +925,354 @@ static vector<NameSpan> detect_names(const string& s, int level)
 }
 
 // -------------------------------------------------------------------- vault
+enum CharFeature : uint32_t
+{
+    FEAT_NONE       = 0,
+    FEAT_AT         = 1u << 0,
+    FEAT_COLON_EQ   = 1u << 1,
+    FEAT_DIGIT      = 1u << 2,
+    FEAT_DASH_UNDER = 1u << 3,
+    FEAT_DOT        = 1u << 4,
+    FEAT_PLUS       = 1u << 5
+};
+
+static uint32_t scan_char_features(const string& text)
+{
+    uint32_t mask = FEAT_NONE;
+    const uint32_t all = FEAT_AT | FEAT_COLON_EQ | FEAT_DIGIT | FEAT_DASH_UNDER | FEAT_DOT | FEAT_PLUS;
+    for (unsigned char c : text)
+    {
+        if (c == '@') mask |= FEAT_AT;
+        else if (c == ':' || c == '=') mask |= FEAT_COLON_EQ;
+        else if (c >= '0' && c <= '9') mask |= FEAT_DIGIT;
+        else if (c == '-' || c == '_') mask |= FEAT_DASH_UNDER;
+        else if (c == '.') mask |= FEAT_DOT;
+        else if (c == '+') mask |= FEAT_PLUS;
+        if (mask == all) break;
+    }
+    return mask;
+}
+
+static vector<pair<size_t, size_t>> find_placeholder_spans(const string& text)
+{
+    vector<pair<size_t, size_t>> spans;
+    size_t pos = 0;
+    const size_t n = text.size();
+    while ((pos = text.find("[[", pos)) != string::npos)
+    {
+        size_t p = pos + 2;
+        if (p >= n || text[p] < 'A' || text[p] > 'Z')
+        {
+            ++pos;
+            continue;
+        }
+        size_t q = p + 1;
+        while (q < n)
+        {
+            char c = text[q];
+            if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') ++q;
+            else break;
+        }
+        if (q + 1 < n && text[q] == ']' && text[q + 1] == ']')
+        {
+            size_t k = q;
+            while (k > p && text[k - 1] >= '0' && text[k - 1] <= '9') --k;
+            if (k < q && k > p && text[k - 1] == '_')
+            {
+                spans.push_back({ pos, q + 2 });
+                pos = q + 2;
+                continue;
+            }
+        }
+        ++pos;
+    }
+    return spans;
+}
+
+static bool overlaps_placeholder(size_t start, size_t end, const vector<pair<size_t, size_t>>& ph)
+{
+    if (ph.empty()) return false;
+    auto it = lower_bound(ph.begin(), ph.end(), start,
+        [](const pair<size_t, size_t>& span, size_t pos) { return span.second <= pos; });
+    return it != ph.end() && it->first < end;
+}
+
+struct Term
+{
+    string cat;
+    string low;      // lower-cased text
+};
+
+class AhoCorasick
+{
+public:
+    struct Match
+    {
+        size_t start;
+        size_t end;
+        string cat;
+    };
+
+private:
+    struct Pattern
+    {
+        string text;
+        string cat;
+    };
+
+    struct Node
+    {
+        vector<pair<unsigned char, int>> next;
+        int fail = 0;
+        int out_pat = -1;
+        int dict_link = -1;
+    };
+
+    bool case_fold = false;
+    vector<Pattern> patterns;
+    vector<Node> nodes;
+    int root_next[256];
+
+    static unsigned char fold_byte(unsigned char c, bool fold)
+    {
+        return fold ? (unsigned char)tolower(c) : c;
+    }
+
+    int find_child(int state, unsigned char c) const
+    {
+        for (const auto& kv : nodes[state].next)
+            if (kv.first == c) return kv.second;
+        return -1;
+    }
+
+    void set_child(int state, unsigned char c, int target)
+    {
+        for (auto& kv : nodes[state].next)
+        {
+            if (kv.first == c) { kv.second = target; return; }
+        }
+        nodes[state].next.push_back({ c, target });
+    }
+
+    void begin_build()
+    {
+        clear();
+        nodes.assign(1, Node{});
+    }
+
+    void insert_pattern(const string& raw_pat, const string& cat)
+    {
+        if (raw_pat.empty()) return;
+        string pat = case_fold ? lower(raw_pat) : raw_pat;
+        int cur = 0;
+        for (unsigned char c : pat)
+        {
+            int nxt = find_child(cur, c);
+            if (nxt == -1)
+            {
+                nxt = (int)nodes.size();
+                nodes.emplace_back();
+                set_child(cur, c, nxt);
+            }
+            cur = nxt;
+        }
+        if (nodes[cur].out_pat == -1)
+        {
+            int pid = (int)patterns.size();
+            patterns.push_back({ move(pat), cat });
+            nodes[cur].out_pat = pid;
+        }
+    }
+
+    void finalize_links()
+    {
+        for (const auto& kv : nodes[0].next)
+        {
+            root_next[kv.first] = kv.second;
+        }
+
+        vector<int> q;
+        q.reserve(nodes.size());
+        for (const auto& kv : nodes[0].next)
+        {
+            int child = kv.second;
+            nodes[child].fail = 0;
+            nodes[child].dict_link = -1;
+            q.push_back(child);
+        }
+
+        for (size_t qh = 0; qh < q.size(); ++qh)
+        {
+            int u = q[qh];
+            for (const auto& kv : nodes[u].next)
+            {
+                unsigned char c = kv.first;
+                int v = kv.second;
+                int f = nodes[u].fail;
+                while (f != 0 && find_child(f, c) == -1) f = nodes[f].fail;
+                int fc = (f == 0) ? root_next[c] : find_child(f, c);
+                if (fc == -1) fc = 0;
+                nodes[v].fail = fc;
+                nodes[v].dict_link = (nodes[fc].out_pat != -1) ? fc : nodes[fc].dict_link;
+                q.push_back(v);
+            }
+        }
+    }
+
+    template <typename Callback>
+    bool scan_impl(const string& text, bool whole_word, const vector<pair<size_t, size_t>>& ph, Callback&& on_match) const
+    {
+        if (patterns.empty() || text.empty() || nodes.empty()) return false;
+        int state = 0;
+        const size_t n = text.size();
+        for (size_t i = 0; i < n; ++i)
+        {
+            unsigned char c = fold_byte((unsigned char)text[i], case_fold);
+            if (state == 0)
+            {
+                state = root_next[c];
+            }
+            else
+            {
+                int nxt = find_child(state, c);
+                if (nxt == -1)
+                {
+                    int f = nodes[state].fail;
+                    while (f != 0 && find_child(f, c) == -1) f = nodes[f].fail;
+                    nxt = (f == 0) ? root_next[c] : find_child(f, c);
+                    if (nxt == -1) nxt = 0;
+                }
+                state = nxt;
+            }
+
+            if (nodes[state].out_pat != -1 || nodes[state].dict_link != -1)
+            {
+                size_t end = i + 1;
+                int m = (nodes[state].out_pat != -1) ? state : nodes[state].dict_link;
+                while (m != -1)
+                {
+                    int pid = nodes[m].out_pat;
+                    const string& pat = patterns[(size_t)pid].text;
+                    size_t start = end - pat.size();
+                    bool ok = true;
+                    if (whole_word)
+                    {
+                        bool lb = !word_char((unsigned char)pat.front()) || start == 0 || !word_char((unsigned char)text[start - 1]);
+                        bool rb = !word_char((unsigned char)pat.back()) || end == n || !word_char((unsigned char)text[end]);
+                        ok = lb && rb;
+                    }
+                    if (ok && !overlaps_placeholder(start, end, ph))
+                    {
+                        if (on_match(start, end, (size_t)pid)) return true;
+                    }
+                    m = nodes[m].dict_link;
+                }
+            }
+        }
+        return false;
+    }
+
+public:
+    explicit AhoCorasick(bool fold = false) : case_fold(fold)
+    {
+        fill(begin(root_next), end(root_next), 0);
+    }
+
+    ~AhoCorasick() { clear(); }
+
+    bool empty() const { return patterns.empty(); }
+
+    void clear()
+    {
+        for (auto& p : patterns)
+        {
+            volatile char* ptr = const_cast<volatile char*>(p.text.data());
+            for (size_t i = 0; i < p.text.size(); ++i) ptr[i] = 0;
+            ptr = const_cast<volatile char*>(p.cat.data());
+            for (size_t i = 0; i < p.cat.size(); ++i) ptr[i] = 0;
+        }
+        patterns.clear();
+        nodes.clear();
+        fill(begin(root_next), end(root_next), 0);
+    }
+
+    void build(const vector<pair<string, string>>& items)
+    {
+        begin_build();
+        for (const auto& [pat, cat] : items) insert_pattern(pat, cat);
+        finalize_links();
+    }
+
+    void build_terms(const vector<Term>& items)
+    {
+        begin_build();
+        for (const auto& t : items) insert_pattern(t.low, t.cat);
+        finalize_links();
+    }
+
+    bool has_any_match(const string& text, bool whole_word = false,
+                       const vector<pair<size_t, size_t>>* ph_ptr = nullptr) const
+    {
+        if (patterns.empty() || text.empty()) return false;
+        vector<pair<size_t, size_t>> local_ph;
+        const vector<pair<size_t, size_t>>& ph = ph_ptr ? *ph_ptr : (local_ph = find_placeholder_spans(text), local_ph);
+        return scan_impl(text, whole_word, ph, [](size_t, size_t, size_t) { return true; });
+    }
+
+    vector<Match> find_matches(const string& text, bool whole_word = false,
+                               const vector<pair<size_t, size_t>>* ph_ptr = nullptr) const
+    {
+        vector<Match> out;
+        if (patterns.empty() || text.empty()) return out;
+        vector<pair<size_t, size_t>> local_ph;
+        const vector<pair<size_t, size_t>>& ph = ph_ptr ? *ph_ptr : (local_ph = find_placeholder_spans(text), local_ph);
+
+        struct Candidate { size_t start, end, pid; };
+        vector<Candidate> cands;
+        scan_impl(text, whole_word, ph, [&](size_t s, size_t e, size_t pid) {
+            cands.push_back({ s, e, pid });
+            return false;
+        });
+        if (cands.empty()) return out;
+        if (cands.size() == 1)
+        {
+            out.push_back({ cands[0].start, cands[0].end, patterns[cands[0].pid].cat });
+            return out;
+        }
+
+        sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
+            size_t la = a.end - a.start;
+            size_t lb = b.end - b.start;
+            if (la != lb) return la > lb;
+            if (a.start != b.start) return a.start < b.start;
+            return a.pid < b.pid;
+        });
+
+        map<size_t, pair<size_t, size_t>> acc;
+        for (const auto& c : cands)
+        {
+            auto it = acc.lower_bound(c.start);
+            if (it != acc.end() && it->first < c.end) continue;
+            if (it != acc.begin() && prev(it)->second.first > c.start) continue;
+            acc.emplace(c.start, make_pair(c.end, c.pid));
+        }
+
+        out.reserve(acc.size());
+        for (const auto& [s, ep] : acc)
+        {
+            out.push_back({ s, ep.first, patterns[ep.second].cat });
+        }
+        return out;
+    }
+};
+
 struct Rule
 {
     string cat;
     regex rx;
     size_t group;
     function<bool(const string&)> validate;
-};
-
-struct Term
-{
-    string cat;
-    string low;      // lower-cased text
+    uint32_t required_features;
 };
 
 class prosze
@@ -947,9 +1283,11 @@ class prosze
     map<string, int> counters;
     set<string> term_cats;
     vector<Rule> rules;
-    vector<pair<string, string>> literals;   // exact .env values, longest first
-    vector<Term> terms;                      // names, longest first
+    vector<pair<string, string>> literals;   // exact .env values
+    vector<Term> terms;                      // listed + learned names
     map<string, string> name_fold;           // lowercase name -> placeholder (any name category)
+    mutable AhoCorasick literals_ac{false};
+    mutable AhoCorasick terms_ac{true};
 public:
     string passphrase;
     bool ephemeral = false;
@@ -959,6 +1297,8 @@ public:
     int name_level = 2;                      // 0 off, 1 strict, 2 normal, 3 aggressive
     size_t hits = 0;
     bool dirty = false;
+    mutable bool literals_dirty = false;
+    mutable bool terms_dirty = false;
 
     ~prosze()
     {
@@ -1008,6 +1348,9 @@ public:
         }
         terms.clear();
 
+        literals_ac.clear();
+        terms_ac.clear();
+
         zero_str(passphrase);
         passphrase.clear();
         session_keys.clear();
@@ -1018,52 +1361,53 @@ public:
         for (const char* c : { "PERSON", "ORG", "CUSTOMER", "PROJECT", "NAME" }) term_cats.insert(c);
 
         // Order matters: wide / specific patterns first.
-        add("PASSWORD", R"RX(\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+:([^\s@/]+)@)RX", 1, not_placeholder);
-        add("EMAIL", R"RX([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})RX");
+        add("PASSWORD", R"RX(\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+:([^\s@/]+)@)RX", 1, not_placeholder, false, FEAT_AT | FEAT_COLON_EQ);
+        add("EMAIL", R"RX([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})RX", 0, nullptr, false, FEAT_AT | FEAT_DOT);
 
-        add("TOKEN", R"RX(\b(?:AKIA|ASIA)[A-Z0-9]{16}\b)RX");
-        add("TOKEN", R"RX(\bAIza[0-9A-Za-z_\-]{35}\b)RX");
-        add("TOKEN", R"RX(\bhf_[A-Za-z0-9]{30,}\b)RX");
-        add("TOKEN", R"RX(\bgithub_pat_[A-Za-z0-9_]{20,}\b)RX");
-        add("TOKEN", R"RX(https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+)RX");
-        add("TOKEN", R"RX(\b(?:sk|pk|rk|ghp|gho|ghs|ghu|glpat|xox[baprs])[-_][A-Za-z0-9_\-]{12,}\b)RX");
-        add("TOKEN", R"RX(\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b)RX");
-        add("TOKEN", R"RX(\bBearer\s+([A-Za-z0-9_\-\.=]{16,}))RX", 1, not_placeholder);
+        add("TOKEN", R"RX(\b(?:AKIA|ASIA)[A-Z0-9]{16}\b)RX", 0, nullptr, false, FEAT_NONE);
+        add("TOKEN", R"RX(\bAIza[0-9A-Za-z_\-]{35}\b)RX", 0, nullptr, false, FEAT_NONE);
+        add("TOKEN", R"RX(\bhf_[A-Za-z0-9]{30,}\b)RX", 0, nullptr, false, FEAT_DASH_UNDER);
+        add("TOKEN", R"RX(\bgithub_pat_[A-Za-z0-9_]{20,}\b)RX", 0, nullptr, false, FEAT_DASH_UNDER);
+        add("TOKEN", R"RX(https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+)RX", 0, nullptr, false, FEAT_DOT);
+        add("TOKEN", R"RX(\b(?:sk|pk|rk|ghp|gho|ghs|ghu|glpat|xox[baprs])[-_][A-Za-z0-9_\-]{12,}\b)RX", 0, nullptr, false, FEAT_DASH_UNDER);
+        add("TOKEN", R"RX(\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b)RX", 0, nullptr, false, FEAT_DOT);
+        add("TOKEN", R"RX(\bBearer\s+([A-Za-z0-9_\-\.=]{16,}))RX", 1, not_placeholder, false, FEAT_NONE);
 
         // name = value, where the name smells like a secret
         add("PASSWORD",
             R"RX(([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|credential)[A-Za-z0-9_.\-]*)["']?\s*[:=]\s*["']?([^\s"',;]{6,}))RX",
-            2, kv_ok, true);
+            2, kv_ok, true, FEAT_COLON_EQ);
 
         // bank accounts, SSN, labeled phones
-        add("IBAN", R"RX(\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b)RX", 0, iban_ok);
+        add("IBAN", R"RX(\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b)RX", 0, iban_ok, false, FEAT_DIGIT);
         add("ACCOUNT",
             R"RX(\b(?:account|acct|a/c|iban|konto|konta)\b\s*(?:no\.?|number|nr\.?|#)?\s*[:=#]?\s*((?:[A-Z]{2}\d{2} ?)?\d[\d \-]{5,30}\d))RX",
-            1, not_placeholder, true);
-        add("SSN", R"RX(\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b)RX");
+            1, not_placeholder, true, FEAT_DIGIT);
+        add("SSN", R"RX(\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b)RX", 0, nullptr, false, FEAT_DASH_UNDER | FEAT_DIGIT);
         add("PHONE",
             R"RX(\b(?:phone|tel|telephone|mobile|cell|fax|whatsapp)\b\s*(?:no\.?|number|#)?\s*[:=]?\s*(\+?\d[\d ()./\-]{5,18}\d))RX",
-            1, phone_labeled_ok, true);
+            1, phone_labeled_ok, true, FEAT_DIGIT);
 
-        add("CARD", R"RX(\b\d(?:[ \-]?\d){12,18}\b)RX", 0, luhn_ok);
-        add("APIKEY", R"RX(\b[A-Za-z0-9]{32}\b)RX", 0, looks_random);
-        add("APIKEY", R"RX(\b[A-Fa-f0-9]{40,64}\b)RX");
-        add("IP", R"RX(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)RX", 0, private_ip);
-        add("IP", R"RX(\b(?:f[cd][0-9a-f]{2}|fe80):(?:[0-9a-f:]*:[0-9a-f]+|:)(?!:))RX", 0, nullptr, true);
+        add("CARD", R"RX(\b\d(?:[ \-]?\d){12,18}\b)RX", 0, luhn_ok, false, FEAT_DIGIT);
+        add("APIKEY", R"RX(\b[A-Za-z0-9]{32}\b)RX", 0, looks_random, false, FEAT_DIGIT);
+        add("APIKEY", R"RX(\b[A-Fa-f0-9]{40,64}\b)RX", 0, nullptr, false, FEAT_NONE);
+        add("IP", R"RX(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)RX", 0, private_ip, false, FEAT_DIGIT | FEAT_DOT);
+        add("IP", R"RX(\b(?:f[cd][0-9a-f]{2}|fe80):(?:[0-9a-f:]*:[0-9a-f]+|:)(?!:))RX", 0, nullptr, true, FEAT_COLON_EQ);
 
         // std::regex has no look-behind: the leading boundary is captured in
         // group 1 and only group 2 (the number) is replaced.
-        add("PHONE", R"RX((^|[^\w.+\-])(\+\d[\d ()./\-]{7,18}\d)(?!\w))RX", 2, phone_intl_ok);
+        add("PHONE", R"RX((^|[^\w.+\-])(\+\d[\d ()./\-]{7,18}\d)(?!\w))RX", 2, phone_intl_ok, false, FEAT_PLUS | FEAT_DIGIT);
         add("PHONE",
             R"RX((^|[^\w.+/\-])(\(?\d{2,4}\)?[ .\-]\d{2,4}[ .\-]\d{2,4}(?:[ .\-]\d{2,4})?)(?![\w/\-]))RX",
-            2, phone_sep_ok);
+            2, phone_sep_ok, false, FEAT_DIGIT);
     }
 
     void add(const string& cat, const string& pat, size_t group = 0,
-             function<bool(const string&)> v = nullptr, bool icase = false)
+             function<bool(const string&)> v = nullptr, bool icase = false,
+             uint32_t required_features = FEAT_NONE)
     {
         auto flags = regex::ECMAScript | (icase ? regex::icase : regex::ECMAScript);
-        rules.push_back({ cat, regex(pat, flags), group, move(v) });
+        rules.push_back({ cat, regex(pat, flags), group, move(v), required_features });
     }
 
     // "Acme Corp" or "CUSTOMER=Acme Corp"
@@ -1081,8 +1425,7 @@ public:
         }
         if (text.size() < 2) return;
         terms.push_back({ cat, lower(text) });
-        sort(terms.begin(), terms.end(),
-             [](const Term& a, const Term& b) { return a.low.size() > b.low.size(); });
+        terms_dirty = true;
         term_cats.insert(cat);
         // names already present in a loaded map keep their placeholder
         for (auto& [k, v] : forward)
@@ -1106,8 +1449,7 @@ public:
     {
         if (s.size() < 4) return;     // "1", "yes"... would shred ordinary text
         literals.push_back({ s, "ENV" });
-        sort(literals.begin(), literals.end(),
-             [](auto& a, auto& b) { return a.first.size() > b.first.size(); });
+        literals_dirty = true;
     }
 
     bool load_env(const string& path)
@@ -1164,9 +1506,14 @@ public:
         fresh.clear();
         string t = replace_literals(input);
         t = replace_key_blocks(t);
-        for (const Rule& r : rules) t = apply(t, r);
+        const uint32_t features = scan_char_features(t);
+        for (const Rule& r : rules)
+        {
+            if ((features & r.required_features) != r.required_features) continue;
+            t = apply(t, r);
+        }
         t = replace_base64_secrets(t);
-        for (const Term& term : terms) t = replace_term(t, term);   // listed + learned names
+        t = replace_terms(t);                                       // listed + learned names
         return auto_names(t);                                       // names nobody listed
     }
 
@@ -1364,8 +1711,7 @@ private:
         string low = lower(value);
         for (auto& t : terms) if (t.low == low) return;
         terms.push_back({ cat, low });
-        sort(terms.begin(), terms.end(),
-             [](const Term& a, const Term& b) { return a.low.size() > b.low.size(); });
+        terms_dirty = true;
     }
 
     string save_name(const string& value, const string& cat)
@@ -1399,53 +1745,66 @@ private:
         }
         out.append(text, last, string::npos);
         for (auto& f : found) learn(f.first, f.second);
-        for (auto& f : found) out = replace_term(out, Term{ f.first, lower(f.second) });   // other mentions
+        out = replace_terms(out);   // other mentions
 
         // Parts of a name: "Jan Kowalski" -> "Jan", "Kowalski";  "Acme Corp" -> "Acme".
         vector<pair<string, string>> extra;
         for (auto& f : found)
             for (auto& a : aliases_of(f.first, f.second)) extra.push_back({ f.first, a });
         for (auto& x : extra) learn(x.first, x.second);
-        for (auto& x : extra) out = replace_term(out, Term{ x.first, lower(x.second) });
+        out = replace_terms(out);
         return out;
     }
 
-    string replace_literals(string text)
+    void ensure_literals_ac() const
     {
-        for (auto& [lit, cat] : literals)
+        if (literals_dirty)
         {
-            size_t pos = 0;
-            while ((pos = text.find(lit, pos)) != string::npos)
-            {
-                string ph = save(lit, cat);
-                text.replace(pos, lit.size(), ph);
-                pos += ph.size();
-            }
+            literals_ac.build(literals);
+            literals_dirty = false;
         }
-        return text;
     }
 
-    // Case-insensitive, whole-word match of a listed name.
-    string replace_term(const string& text, const Term& term)
+    void ensure_terms_ac() const
     {
-        const string low = lower(text);
-        const string& t = term.low;
-        string out; size_t pos = 0, last = 0;
-        while ((pos = low.find(t, pos)) != string::npos)
+        if (terms_dirty)
         {
-            size_t end = pos + t.size();
-            bool lb = !word_char((unsigned char)t.front()) || pos == 0 || !word_char((unsigned char)text[pos - 1]);
-            bool rb = !word_char((unsigned char)t.back()) || end == text.size() || !word_char((unsigned char)text[end]);
-            if (lb && rb)
-            {
-                out.append(text, last, pos - last);
-                out.append(save(text.substr(pos, t.size()), term.cat));
-                last = pos = end;
-            }
-            else ++pos;
+            terms_ac.build_terms(terms);
+            terms_dirty = false;
+        }
+    }
+
+    string replace_ac(const string& text, const AhoCorasick& ac, bool whole_word)
+    {
+        if (ac.empty() || text.empty()) return text;
+        vector<AhoCorasick::Match> matches = ac.find_matches(text, whole_word);
+        if (matches.empty()) return text;
+        string out;
+        out.reserve(text.size());
+        size_t last = 0;
+        for (const auto& m : matches)
+        {
+            out.append(text, last, m.start - last);
+            out.append(save(text.substr(m.start, m.end - m.start), m.cat));
+            last = m.end;
         }
         out.append(text, last, string::npos);
         return out;
+    }
+
+    string replace_literals(const string& text)
+    {
+        if (literals.empty() || text.empty()) return text;
+        ensure_literals_ac();
+        return replace_ac(text, literals_ac, false);
+    }
+
+    // Case-insensitive, whole-word match of listed and learned names.
+    string replace_terms(const string& text)
+    {
+        if (terms.empty() || text.empty()) return text;
+        ensure_terms_ac();
+        return replace_ac(text, terms_ac, true);
     }
 
     string replace_key_blocks(const string& text)
@@ -1497,9 +1856,11 @@ private:
 
     bool contains_secret(const string& decoded) const
     {
-        for (const auto& [lit, cat] : literals)
+        const vector<pair<size_t, size_t>> ph = find_placeholder_spans(decoded);
+        if (!literals.empty())
         {
-            if (decoded.find(lit) != string::npos) return true;
+            ensure_literals_ac();
+            if (literals_ac.has_any_match(decoded, false, &ph)) return true;
         }
         size_t b = decoded.find("-----BEGIN ");
         if (b != string::npos)
@@ -1512,8 +1873,10 @@ private:
                     return true;
             }
         }
+        const uint32_t features = scan_char_features(decoded);
         for (const Rule& r : rules)
         {
+            if ((features & r.required_features) != r.required_features) continue;
             for (auto it = sregex_iterator(decoded.begin(), decoded.end(), r.rx);
                  it != sregex_iterator(); ++it)
             {
@@ -1526,25 +1889,17 @@ private:
                 }
             }
         }
-        for (const Term& term : terms)
+        if (!terms.empty())
         {
-            const string low = lower(decoded);
-            const string& t = term.low;
-            size_t pos = 0;
-            while ((pos = low.find(t, pos)) != string::npos)
-            {
-                size_t end = pos + t.size();
-                bool lb = !word_char((unsigned char)t.front()) || pos == 0 || !word_char((unsigned char)decoded[pos - 1]);
-                bool rb = !word_char((unsigned char)t.back()) || end == decoded.size() || !word_char((unsigned char)decoded[end]);
-                if (lb && rb) return true;
-                ++pos;
-            }
+            ensure_terms_ac();
+            if (terms_ac.has_any_match(decoded, true, &ph)) return true;
         }
         return false;
     }
 
     string replace_base64_secrets(const string& text)
     {
+        if (text.size() < 24) return text;
         static const regex b64_cand(R"RX(\b[A-Za-z0-9+/]{24,}(?:={1,2}(?![A-Za-z0-9+/=])|\b))RX");
         string out; size_t last = 0;
         for (auto it = sregex_iterator(text.begin(), text.end(), b64_cand);

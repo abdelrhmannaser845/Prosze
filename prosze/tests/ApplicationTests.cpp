@@ -2,6 +2,7 @@
 #include "../Application.cpp"
 
 #include <cassert>
+#include <chrono>
 #include <filesystem>
 
 using namespace std;
@@ -324,6 +325,147 @@ static void test_base64_encoded_secret_scanner()
     assert(v.restore("[[ENCODED_99]]") == "[[ENCODED_99]]");
 }
 
+static void test_aho_corasick_literals_terms_and_placeholder_immunity()
+{
+    // Direct AhoCorasick overlap and whole-word suffix fallback
+    AhoCorasick ac(true);
+    ac.build({ { "Big Acme", "ORG" }, { "Acme", "CUSTOMER" } });
+    auto matches = ac.find_matches("xBig Acme and Big Acme", true);
+    assert(matches.size() == 2);
+    assert(matches[0].start == 5 && matches[0].end == 9 && matches[0].cat == "CUSTOMER");
+    assert(matches[1].start == 14 && matches[1].end == 22 && matches[1].cat == "ORG");
+
+    prosze v;
+    v.name_level = 0;
+    assert(!v.literals_dirty);
+    assert(!v.terms_dirty);
+
+    v.add_literal("Acme");
+    v.add_literal("Acme Corp");
+    v.add_literal("CUSTOMER_1");
+    assert(v.literals_dirty);
+
+    v.add_term("CUSTOMER=Acme");
+    v.add_term("ORG=Acme Corp");
+    v.add_term("PERSON=Jan");
+    v.add_term("TERM=CUSTOMER_1");
+    assert(v.terms_dirty);
+
+    // Longest-match priority for literals ("Acme Corp" beats "Acme") and placeholder immunity
+    string lit_out = v.redact("Hello Acme Corp, Acme, [[CUSTOMER_1]], and CUSTOMER_1.");
+    assert(!v.literals_dirty);
+    assert(!v.terms_dirty);
+    assert(lit_out == "Hello [[ENV_1]], [[ENV_2]], [[CUSTOMER_1]], and [[ENV_3]].");
+    assert(v.restore(lit_out) == "Hello Acme Corp, Acme, [[CUSTOMER_1]], and CUSTOMER_1.");
+
+    // Case-insensitive whole-word term matching, boundary enforcement, and lazy dirty rebuild
+    prosze tv;
+    tv.name_level = 0;
+    tv.add_term("ORG=Acme Corp");
+    tv.add_term("PROJECT=Acme");
+    tv.add_term("PERSON=Jan");
+    tv.add_term("TERM=CUSTOMER_1");
+    assert(tv.terms_dirty);
+
+    string term_out = tv.redact("Dear Jan, Janek at ACME CORP and acme saw [[CUSTOMER_1]] and CUSTOMER_1.");
+    assert(!tv.terms_dirty);
+    assert(term_out == "Dear [[PERSON_1]], Janek at [[ORG_1]] and [[PROJECT_1]] saw [[CUSTOMER_1]] and [[TERM_1]].");
+    assert(tv.restore(term_out) == "Dear Jan, Janek at ACME CORP and acme saw [[CUSTOMER_1]] and CUSTOMER_1.");
+
+    // Lazy rebuild when a new literal/term is added after initial redact()
+    tv.add_term("PROJECT=Apollo");
+    tv.add_literal("new-secret-val");
+    assert(tv.terms_dirty);
+    assert(tv.literals_dirty);
+    string second = tv.redact("apollo uses new-secret-val");
+    assert(!tv.terms_dirty);
+    assert(!tv.literals_dirty);
+    assert(second == "[[PROJECT_2]] uses [[ENV_1]]");
+
+    // auto_names learn() triggers lazy terms_ac rebuild for subsequent mentions & aliases
+    prosze nv;
+    string nout = nv.redact("Contact Jan Kowalski. Later jan kowalski and Kowalski replied.");
+    assert(!nv.terms_dirty);
+    assert(nout == "Contact [[PERSON_1]]. Later [[PERSON_1]] and [[PERSON_2]] replied.");
+}
+
+static void test_prefilter_accuracy_and_zero_match_fast_path()
+{
+    assert(scan_char_features("Plain prose without digits or special symbols") == FEAT_NONE);
+    assert(scan_char_features("a@b.c") == (FEAT_AT | FEAT_DOT));
+    assert(scan_char_features("k=v:1-2_3+4") == (FEAT_COLON_EQ | FEAT_DIGIT | FEAT_DASH_UNDER | FEAT_PLUS));
+
+    prosze v;
+    v.name_level = 0;
+
+    // Plain prose zero-match fast path
+    string prose = "Just ordinary English prose without any sensitive markers at all";
+    assert(scan_char_features(prose) == FEAT_NONE);
+    assert(v.redact(prose) == prose);
+    assert(v.hits == 0);
+
+    // Every secret category + zero-digit edge cases (fcab::cdef, digitless AKIA/AIza/Bearer/hex)
+    assert(v.redact("url https://bob:secret99@host.internal/api").find("[[PASSWORD_1]]") != string::npos);
+    assert(v.redact("mail alice@example.com").find("[[EMAIL_1]]") != string::npos);
+    assert(v.redact("aws AKIAAAAAAAAAAAAAAAAA").find("[[TOKEN_1]]") != string::npos);
+    assert(v.redact("gcp AIzaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").find("[[TOKEN_2]]") != string::npos);
+    assert(v.redact("hf hf_abcdefghijklmnopqrstuvwxyz012345").find("[[TOKEN_3]]") != string::npos);
+    assert(v.redact("gh github_pat_11ABCD0123456789012345").find("[[TOKEN_4]]") != string::npos);
+    assert(v.redact("slack https://hooks.slack.com/services/T11/B22/XYZ123").find("[[TOKEN_5]]") != string::npos);
+    assert(v.redact("openai sk-proj-abcdef1234567890").find("[[TOKEN_6]]") != string::npos);
+    assert(v.redact("jwt eyJabcdefgh.eyJijklmnop.signature12").find("[[TOKEN_7]]") != string::npos);
+    assert(v.redact("auth Bearer AbCdEfGhIjKlMnOpQrSt").find("[[TOKEN_8]]") != string::npos);
+    assert(v.redact("cfg password=mysecretpass").find("[[PASSWORD_2]]") != string::npos);
+    assert(v.redact("iban DE89370400440532013000").find("[[IBAN_1]]") != string::npos);
+    assert(v.redact("acct account 123456789").find("[[ACCOUNT_1]]") != string::npos);
+    assert(v.redact("ssn 123-45-6789").find("[[SSN_1]]") != string::npos);
+    assert(v.redact("tel phone: 555 123 4567").find("[[PHONE_1]]") != string::npos);
+    assert(v.redact("card 4111111111111111").find("[[CARD_1]]") != string::npos);
+    assert(v.redact("rand A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6").find("[[APIKEY_1]]") != string::npos);
+    assert(v.redact("hex abcdefabcdefabcdefabcdefabcdefabcdefabcd").find("[[APIKEY_2]]") != string::npos);
+    assert(v.redact("ipv4 192.168.1.50").find("[[IP_1]]") != string::npos);
+    assert(v.redact("ipv6 fcab::cdef").find("[[IP_2]]") != string::npos);
+    assert(v.redact("intl +48 601 234 567").find("[[PHONE_2]]") != string::npos);
+    assert(v.redact("sep 601 234 567").find("[[PHONE_3]]") != string::npos);
+
+    // Base64 < 24 fast path does not match short base64-like tokens
+    string short_b64 = "cGFzc3dvcmQ9MTIz"; // 16 chars
+    assert(v.redact(short_b64) == short_b64);
+}
+
+static void test_50kb_throughput()
+{
+    prosze v;
+    v.name_level = 0;
+    for (int i = 0; i < 100; ++i)
+    {
+        v.add_term("CUSTOMER=CustomerOrganization" + to_string(i));
+    }
+    for (int i = 0; i < 50; ++i)
+    {
+        v.add_literal("literal_secret_value_" + to_string(i));
+    }
+
+    string chunk = "The team reviewed architecture notes and deployment timelines during weekly planning. ";
+    string payload;
+    payload.reserve(55000);
+    while (payload.size() < 50 * 1024)
+    {
+        payload += chunk;
+    }
+    payload += " Contact CustomerOrganization42 regarding literal_secret_value_17.";
+
+    // Warm/include lazy build inside timed redaction
+    auto t0 = chrono::steady_clock::now();
+    string safe = v.redact(payload);
+    auto t1 = chrono::steady_clock::now();
+    double elapsed_ms = chrono::duration<double, milli>(t1 - t0).count();
+
+    assert(safe.find("[[CUSTOMER_1]]") != string::npos);
+    assert(safe.find("[[ENV_1]]") != string::npos);
+    assert(elapsed_ms < 500.0);
+}
+
 int main()
 {
     test_redaction_and_restoration();
@@ -336,5 +478,8 @@ int main()
     test_strict_restore_blocks_preloaded_placeholders();
     test_cloud_and_ai_secret_rules_and_ips();
     test_base64_encoded_secret_scanner();
+    test_aho_corasick_literals_terms_and_placeholder_immunity();
+    test_prefilter_accuracy_and_zero_match_fast_path();
+    test_50kb_throughput();
     return 0;
 }

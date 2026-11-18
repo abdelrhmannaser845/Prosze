@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -13,7 +14,19 @@ PACKAGE_DIR = Path(__file__).resolve().parents[1]
 if str(PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIR))
 
-from prosze_core import Vault, walk
+from prosze_core import (
+    AhoCorasick,
+    FEAT_AT,
+    FEAT_COLON_EQ,
+    FEAT_DASH_UNDER,
+    FEAT_DIGIT,
+    FEAT_DOT,
+    FEAT_NONE,
+    FEAT_PLUS,
+    Vault,
+    scan_char_features,
+    walk,
+)
 from prosze_cli import cli_main
 
 
@@ -433,6 +446,155 @@ class ApplicationTests(unittest.TestCase):
             v.strict_restore = True
             self.assertEqual(v.restore(s1), f"Authorization: {b64_token}")
             self.assertEqual(v.restore("[[ENCODED_99]]"), "[[ENCODED_99]]")
+
+    def test_aho_corasick_literals_terms_and_placeholder_immunity(self):
+        # Direct AhoCorasick overlap and whole-word suffix fallback
+        ac = AhoCorasick(case_fold=True)
+        ac.build([("Big Acme", "ORG"), ("Acme", "CUSTOMER")])
+        matches = ac.find_matches("xBig Acme and Big Acme", whole_word=True)
+        self.assertEqual(matches, [(5, 9, "CUSTOMER"), (14, 22, "ORG")])
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            self.assertFalse(v.literals_dirty)
+            self.assertFalse(v.terms_dirty)
+
+            v.add_literal("Acme")
+            v.add_literal("Acme Corp")
+            v.add_literal("CUSTOMER_1")
+            self.assertTrue(v.literals_dirty)
+
+            lit_out, lit_hits = v.redact("Hello Acme Corp, Acme, [[CUSTOMER_1]], and CUSTOMER_1.")
+            self.assertFalse(v.literals_dirty)
+            self.assertEqual(lit_hits, 3)
+            self.assertEqual(lit_out, "Hello [[ENV_1]], [[ENV_2]], [[CUSTOMER_1]], and [[ENV_3]].")
+            self.assertEqual(v.restore(lit_out), "Hello Acme Corp, Acme, [[CUSTOMER_1]], and CUSTOMER_1.")
+
+            tv = Vault(str(Path(directory) / "terms_map.tsv"))
+            tv._ner_attempted = True
+            tv.add_term("ORG=Acme Corp")
+            tv.add_term("PROJECT=Acme")
+            tv.add_term("PERSON=Jan")
+            tv.add_term("TERM=CUSTOMER_1")
+            self.assertTrue(tv.terms_dirty)
+
+            term_out, term_hits = tv.redact("Dear Jan, Janek at ACME CORP and acme saw [[CUSTOMER_1]] and CUSTOMER_1.")
+            self.assertFalse(tv.terms_dirty)
+            self.assertEqual(term_hits, 4)
+            self.assertEqual(
+                term_out,
+                "Dear [[PERSON_1]], Janek at [[ORG_1]] and [[PROJECT_1]] saw [[CUSTOMER_1]] and [[TERM_1]].",
+            )
+            self.assertEqual(
+                tv.restore(term_out),
+                "Dear Jan, Janek at ACME CORP and acme saw [[CUSTOMER_1]] and CUSTOMER_1.",
+            )
+
+            # Lazy rebuild after adding new literal and term post-redact
+            tv.add_term("PROJECT=Apollo")
+            tv.add_literal("new-secret-val")
+            self.assertTrue(tv.terms_dirty)
+            self.assertTrue(tv.literals_dirty)
+            second, second_hits = tv.redact("apollo uses new-secret-val")
+            self.assertFalse(tv.terms_dirty)
+            self.assertFalse(tv.literals_dirty)
+            self.assertEqual(second_hits, 2)
+            self.assertEqual(second, "[[PROJECT_2]] uses [[ENV_1]]")
+
+    def test_prefilter_accuracy_and_zero_match_fast_path(self):
+        self.assertEqual(scan_char_features("Plain prose without digits or special symbols"), FEAT_NONE)
+        self.assertEqual(scan_char_features("a@b.c"), FEAT_AT | FEAT_DOT)
+        self.assertEqual(
+            scan_char_features("k=v:1-2_3+4"),
+            FEAT_COLON_EQ | FEAT_DIGIT | FEAT_DASH_UNDER | FEAT_PLUS,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+
+            # Zero-match fast path on plain prose skips all non-zero-feature rules
+            prose = "Just ordinary English prose without any sensitive markers at all"
+            self.assertEqual(scan_char_features(prose), FEAT_NONE)
+
+            class SpyRegex:
+                def __init__(self):
+                    self.calls = 0
+
+                def finditer(self, text):
+                    self.calls += 1
+                    return iter(())
+
+            spy = SpyRegex()
+            orig_rules = v.rules
+            v.rules = [("TEST", spy, 0, None, FEAT_AT | FEAT_DIGIT)]
+            try:
+                safe_prose, hits_prose = v.redact(prose)
+                self.assertEqual(safe_prose, prose)
+                self.assertEqual(hits_prose, 0)
+                self.assertEqual(spy.calls, 0)
+                self.assertFalse(v._contains_secret(prose))
+                self.assertEqual(spy.calls, 0)
+            finally:
+                v.rules = orig_rules
+
+            # Every secret category + zero-digit edge cases
+            cases = [
+                ("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----", "[[PRIVKEY_1]]"),
+                ("url https://bob:secret99@host.internal/api", "[[PASSWORD_1]]"),
+                ("mail alice@example.com", "[[EMAIL_1]]"),
+                ("aws AKIAAAAAAAAAAAAAAAAA", "[[TOKEN_1]]"),
+                ("gcp AIzaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "[[TOKEN_2]]"),
+                ("hf hf_abcdefghijklmnopqrstuvwxyz012345", "[[TOKEN_3]]"),
+                ("gh github_pat_11ABCD0123456789012345", "[[TOKEN_4]]"),
+                ("slack https://hooks.slack.com/services/T11/B22/XYZ123", "[[TOKEN_5]]"),
+                ("openai sk-proj-abcdef1234567890", "[[TOKEN_6]]"),
+                ("jwt eyJabcdefgh.eyJijklmnop.signature12", "[[TOKEN_7]]"),
+                ("auth Bearer AbCdEfGhIjKlMnOpQrSt", "[[TOKEN_8]]"),
+                ("cfg password=mysecretpass", "[[PASSWORD_2]]"),
+                ("iban DE89370400440532013000", "[[IBAN_1]]"),
+                ("acct account 123456789", "[[ACCOUNT_1]]"),
+                ("ssn 123-45-6789", "[[SSN_1]]"),
+                ("tel phone: 555 123 4567", "[[PHONE_1]]"),
+                ("card 4111111111111111", "[[CARD_1]]"),
+                ("rand A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6", "[[APIKEY_1]]"),
+                ("hex abcdefabcdefabcdefabcdefabcdefabcdefabcd", "[[APIKEY_2]]"),
+                ("ipv4 192.168.1.50", "[[IP_1]]"),
+                ("ipv6 fcab::cdef", "[[IP_2]]"),
+                ("intl +48 601 234 567", "[[PHONE_2]]"),
+                ("sep 601 234 567", "[[PHONE_3]]"),
+            ]
+            for raw, expected_ph in cases:
+                safe, hits = v.redact(raw)
+                self.assertEqual(hits, 1, f"Expected 1 hit for {raw!r}, got {safe!r}")
+                self.assertIn(expected_ph, safe)
+                self.assertTrue(v._contains_secret(raw))
+
+            # Base64 < 24 fast path does not alter short base64-like tokens
+            short_b64 = "cGFzc3dvcmQ9MTIz"
+            safe_short, hits_short = v.redact(short_b64)
+            self.assertEqual(safe_short, short_b64)
+            self.assertEqual(hits_short, 0)
+
+    def test_50kb_throughput(self):
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            for i in range(100):
+                v.add_term(f"CUSTOMER=CustomerOrganization{i}")
+            for i in range(50):
+                v.add_literal(f"literal_secret_value_{i}")
+
+            chunk = "The team reviewed architecture notes and deployment timelines during weekly planning. "
+            payload = (chunk * ((50 * 1024 // len(chunk)) + 1))
+            payload += " Contact CustomerOrganization42 regarding literal_secret_value_17."
+
+            t0 = time.perf_counter()
+            safe, hits = v.redact(payload)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+            self.assertEqual(hits, 2)
+            self.assertIn("[[CUSTOMER_1]]", safe)
+            self.assertIn("[[ENV_1]]", safe)
+            self.assertLess(elapsed_ms, 500.0)
 
 
 if __name__ == "__main__":

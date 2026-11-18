@@ -8,6 +8,8 @@ This module contains all core functionality that is NOT the proxy or plugin:
 from __future__ import annotations
 
 import base64
+import bisect
+from collections import deque
 import hashlib
 import hmac
 import json
@@ -102,33 +104,250 @@ def unesc(s):
 
 
 # ----------------------------------------------------------------------- vault
+FEAT_NONE = 0
+FEAT_AT = 1 << 0
+FEAT_COLON_EQ = 1 << 1
+FEAT_DIGIT = 1 << 2
+FEAT_DASH_UNDER = 1 << 3
+FEAT_DOT = 1 << 4
+FEAT_PLUS = 1 << 5
+
+_DIGITS_SET = frozenset("0123456789")
+_WORD_CHAR_RE = re.compile(r"\w")
+
+
+def scan_char_features(text: str) -> int:
+    """Compute a bitmask of character classes present in text in a single O(N) pass."""
+    if not text:
+        return FEAT_NONE
+    chars = set(text)
+    mask = FEAT_NONE
+    if "@" in chars:
+        mask |= FEAT_AT
+    if ":" in chars or "=" in chars:
+        mask |= FEAT_COLON_EQ
+    if not chars.isdisjoint(_DIGITS_SET):
+        mask |= FEAT_DIGIT
+    if "-" in chars or "_" in chars:
+        mask |= FEAT_DASH_UNDER
+    if "." in chars:
+        mask |= FEAT_DOT
+    if "+" in chars:
+        mask |= FEAT_PLUS
+    return mask
+
+
+def _is_word_char(ch: str) -> bool:
+    return ch == "_" or ch.isalnum() or bool(_WORD_CHAR_RE.match(ch))
+
+
+def _fold_char(ch: str) -> str:
+    lc = ch.lower()
+    return lc if len(lc) == 1 else ch
+
+
+def _fold_str(s: str) -> str:
+    if s.isascii():
+        return s.lower()
+    return "".join(_fold_char(ch) for ch in s)
+
+
+def _find_placeholder_spans(text: str) -> list[tuple[int, int]]:
+    if "[[" not in text:
+        return []
+    return [m.span() for m in PH.finditer(text)]
+
+
+def _overlaps_placeholder(start: int, end: int, ph_spans: list[tuple[int, int]]) -> bool:
+    if not ph_spans:
+        return False
+    lo, hi = 0, len(ph_spans)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if ph_spans[mid][1] <= start:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo < len(ph_spans) and ph_spans[lo][0] < end
+
+
+class AhoCorasick:
+    """Dependency-free single-pass Aho-Corasick automaton with longest-first resolution."""
+
+    def __init__(self, case_fold: bool = False):
+        self.case_fold = case_fold
+        self.patterns: list[tuple[str, str]] = []
+        self.goto: list[dict[str, int]] = [{}]
+        self.fail: list[int] = [0]
+        self.out_pat: list[int] = [-1]
+        self.dict_link: list[int] = [-1]
+        self.match_head: list[int] = [-1]
+
+    def build(self, items: list[tuple[str, str]]) -> None:
+        self.patterns = []
+        self.goto = [{}]
+        self.fail = [0]
+        self.out_pat = [-1]
+        self.dict_link = [-1]
+        self.match_head = [-1]
+        fold = self.case_fold
+
+        for raw_pat, cat in items:
+            if not raw_pat:
+                continue
+            pat = _fold_str(raw_pat) if fold else raw_pat
+            cur = 0
+            for ch in pat:
+                nxt = self.goto[cur].get(ch)
+                if nxt is None:
+                    nxt = len(self.goto)
+                    self.goto[cur][ch] = nxt
+                    self.goto.append({})
+                    self.fail.append(0)
+                    self.out_pat.append(-1)
+                    self.dict_link.append(-1)
+                    self.match_head.append(-1)
+                cur = nxt
+            if self.out_pat[cur] == -1:
+                pid = len(self.patterns)
+                self.patterns.append((pat, cat))
+                self.out_pat[cur] = pid
+
+        q: deque[int] = deque()
+        for child in self.goto[0].values():
+            self.fail[child] = 0
+            self.dict_link[child] = -1
+            self.match_head[child] = child if self.out_pat[child] != -1 else -1
+            q.append(child)
+
+        while q:
+            u = q.popleft()
+            for ch, v in self.goto[u].items():
+                f = self.fail[u]
+                while f and ch not in self.goto[f]:
+                    f = self.fail[f]
+                fc = self.goto[f].get(ch, 0)
+                self.fail[v] = fc
+                dl = fc if self.out_pat[fc] != -1 else self.dict_link[fc]
+                self.dict_link[v] = dl
+                self.match_head[v] = v if self.out_pat[v] != -1 else dl
+                q.append(v)
+
+    def _scan_candidates(self, text: str, whole_word: bool, ph_spans: list[tuple[int, int]]):
+        if not self.patterns or not text:
+            return
+        goto = self.goto
+        fail = self.fail
+        match_head = self.match_head
+        out_pat = self.out_pat
+        dict_link = self.dict_link
+        patterns = self.patterns
+        goto0 = goto[0]
+        state = 0
+        fold = self.case_fold
+        n = len(text)
+
+        for idx, ch in enumerate(text):
+            if fold:
+                c = ch.lower()
+                if len(c) != 1:
+                    c = ch
+            else:
+                c = ch
+
+            if state == 0:
+                state = goto0.get(c, 0)
+            else:
+                nxt = goto[state].get(c)
+                if nxt is None:
+                    f = fail[state]
+                    while f and c not in goto[f]:
+                        f = fail[f]
+                    state = goto[f].get(c, 0)
+                else:
+                    state = nxt
+
+            m = match_head[state]
+            if m != -1:
+                end = idx + 1
+                while m != -1:
+                    pid = out_pat[m]
+                    plen = len(patterns[pid][0])
+                    start = end - plen
+                    ok = True
+                    if whole_word:
+                        if start > 0 and _is_word_char(text[start - 1]):
+                            ok = False
+                        elif end < n and _is_word_char(text[end]):
+                            ok = False
+                    if ok and not _overlaps_placeholder(start, end, ph_spans):
+                        yield (start, end, pid)
+                    m = dict_link[m]
+
+    def has_any_match(self, text: str, whole_word: bool = False, ph_spans: Optional[list[tuple[int, int]]] = None) -> bool:
+        if not self.patterns or not text:
+            return False
+        if ph_spans is None:
+            ph_spans = _find_placeholder_spans(text)
+        return next(self._scan_candidates(text, whole_word, ph_spans), None) is not None
+
+    def find_matches(self, text: str, whole_word: bool = False, ph_spans: Optional[list[tuple[int, int]]] = None) -> list[tuple[int, int, str]]:
+        if not self.patterns or not text:
+            return []
+        if ph_spans is None:
+            ph_spans = _find_placeholder_spans(text)
+        candidates = list(self._scan_candidates(text, whole_word, ph_spans))
+        if not candidates:
+            return []
+        if len(candidates) == 1:
+            s, e, pid = candidates[0]
+            return [(s, e, self.patterns[pid][1])]
+
+        candidates.sort(key=lambda item: (-(item[1] - item[0]), item[0], item[2]))
+        starts: list[int] = []
+        ends: list[int] = []
+        accepted: list[tuple[int, int, str]] = []
+        patterns = self.patterns
+        for s, e, pid in candidates:
+            pos = bisect.bisect_left(starts, s)
+            if pos < len(starts) and starts[pos] < e:
+                continue
+            if pos > 0 and ends[pos - 1] > s:
+                continue
+            starts.insert(pos, s)
+            ends.insert(pos, e)
+            accepted.append((s, e, patterns[pid][1]))
+        accepted.sort(key=lambda item: item[0])
+        return accepted
+
+
 RULES = [
-    # (category, regex, group, validator, flags)
-    ("PRIVKEY", r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\\Z)", 0, None, re.S),
-    ("PASSWORD", r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+:([^\s@/]+)@", 1, not_placeholder, 0),
-    ("EMAIL", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", 0, None, 0),
-    ("TOKEN", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", 0, None, 0),
-    ("TOKEN", r"\bAIza[0-9A-Za-z_\-]{35}\b", 0, None, 0),
-    ("TOKEN", r"\bhf_[A-Za-z0-9]{30,}\b", 0, None, 0),
-    ("TOKEN", r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", 0, None, 0),
-    ("TOKEN", r"https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+", 0, None, 0),
-    ("TOKEN", r"\b(?:sk|pk|rk|ghp|gho|ghs|ghu|glpat|xox[baprs])[-_][A-Za-z0-9_\-]{12,}\b", 0, None, 0),
-    ("TOKEN", r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b", 0, None, 0),
-    ("TOKEN", r"\bBearer\s+([A-Za-z0-9_\-\.=]{16,})", 1, not_placeholder, 0),
+    # (category, regex, group, validator, flags, required_features)
+    ("PRIVKEY", r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\\Z)", 0, None, re.S, FEAT_DASH_UNDER),
+    ("PASSWORD", r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+:([^\s@/]+)@", 1, not_placeholder, 0, FEAT_AT | FEAT_COLON_EQ),
+    ("EMAIL", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", 0, None, 0, FEAT_AT | FEAT_DOT),
+    ("TOKEN", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", 0, None, 0, FEAT_NONE),
+    ("TOKEN", r"\bAIza[0-9A-Za-z_\-]{35}\b", 0, None, 0, FEAT_NONE),
+    ("TOKEN", r"\bhf_[A-Za-z0-9]{30,}\b", 0, None, 0, FEAT_DASH_UNDER),
+    ("TOKEN", r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", 0, None, 0, FEAT_DASH_UNDER),
+    ("TOKEN", r"https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+", 0, None, 0, FEAT_DOT),
+    ("TOKEN", r"\b(?:sk|pk|rk|ghp|gho|ghs|ghu|glpat|xox[baprs])[-_][A-Za-z0-9_\-]{12,}\b", 0, None, 0, FEAT_DASH_UNDER),
+    ("TOKEN", r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b", 0, None, 0, FEAT_DOT),
+    ("TOKEN", r"\bBearer\s+([A-Za-z0-9_\-\.=]{16,})", 1, not_placeholder, 0, FEAT_NONE),
     ("PASSWORD",
      r"""[A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|credential)[A-Za-z0-9_.\-]*["']?\s*[:=]\s*["']?([^\s"',;]{6,})""",
-     1, kv_ok, re.I),
-    ("IBAN", r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b", 0, iban_ok, 0),
-    ("ACCOUNT", r"\b(?:account|acct|a/c|iban|konto|konta)\b\s*(?:no\.?|number|nr\.?|#)?\s*[:=#]?\s*((?:[A-Z]{2}\d{2} ?)?\d[\d -]{5,30}\d)", 1, not_placeholder, re.I),
-    ("SSN", r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b", 0, None, 0),
-    ("PHONE", r"\b(?:phone|tel|telephone|mobile|cell|fax|whatsapp)\b\s*(?:no\.?|number|#)?\s*[:=]?\s*(\+?\d[\d ()./-]{5,18}\d)", 1, digits_between(6, 15), re.I),
-    ("CARD", r"\b\d(?:[ -]?\d){12,18}\b", 0, luhn_ok, 0),
-    ("APIKEY", r"\b[A-Za-z0-9]{32}\b", 0, looks_random, 0),
-    ("APIKEY", r"\b[A-Fa-f0-9]{40,64}\b", 0, None, 0),
-    ("IP", r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", 0, private_ip, 0),
-    ("IP", r"\b(?:f[cd][0-9a-f]{2}|fe80):(?:[0-9a-f:]*:[0-9a-f]+|:)(?!:)", 0, None, re.I),
-    ("PHONE", r"(?<![\w.+-])\+\d[\d ()./-]{7,18}\d(?!\w)", 0, digits_between(8, 15), 0),
-    ("PHONE", r"(?<![\w.+/-])\(?\d{2,4}\)?[ .-]\d{2,4}[ .-]\d{2,4}(?:[ .-]\d{2,4})?(?![\w/-])", 0, phone_sep_ok, 0),
+     1, kv_ok, re.I, FEAT_COLON_EQ),
+    ("IBAN", r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b", 0, iban_ok, 0, FEAT_DIGIT),
+    ("ACCOUNT", r"\b(?:account|acct|a/c|iban|konto|konta)\b\s*(?:no\.?|number|nr\.?|#)?\s*[:=#]?\s*((?:[A-Z]{2}\d{2} ?)?\d[\d -]{5,30}\d)", 1, not_placeholder, re.I, FEAT_DIGIT),
+    ("SSN", r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b", 0, None, 0, FEAT_DASH_UNDER | FEAT_DIGIT),
+    ("PHONE", r"\b(?:phone|tel|telephone|mobile|cell|fax|whatsapp)\b\s*(?:no\.?|number|#)?\s*[:=]?\s*(\+?\d[\d ()./-]{5,18}\d)", 1, digits_between(6, 15), re.I, FEAT_DIGIT),
+    ("CARD", r"\b\d(?:[ -]?\d){12,18}\b", 0, luhn_ok, 0, FEAT_DIGIT),
+    ("APIKEY", r"\b[A-Za-z0-9]{32}\b", 0, looks_random, 0, FEAT_DIGIT),
+    ("APIKEY", r"\b[A-Fa-f0-9]{40,64}\b", 0, None, 0, FEAT_NONE),
+    ("IP", r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", 0, private_ip, 0, FEAT_DIGIT | FEAT_DOT),
+    ("IP", r"\b(?:f[cd][0-9a-f]{2}|fe80):(?:[0-9a-f:]*:[0-9a-f]+|:)(?!:)", 0, None, re.I, FEAT_COLON_EQ),
+    ("PHONE", r"(?<![\w.+-])\+\d[\d ()./-]{7,18}\d(?!\w)", 0, digits_between(8, 15), 0, FEAT_PLUS | FEAT_DIGIT),
+    ("PHONE", r"(?<![\w.+/-])\(?\d{2,4}\)?[ .-]\d{2,4}[ .-]\d{2,4}(?:[ .-]\d{2,4})?(?![\w/-])", 0, phone_sep_ok, 0, FEAT_DIGIT),
 ]
 PH = re.compile(r"\[\[[A-Z][A-Z0-9_]*_\d+\]\]")
 PH_IDX = re.compile(r"^\[\[([A-Z][A-Z0-9_]*)_(\d+)\]\]$")
@@ -204,9 +423,14 @@ class Vault:
         self.strict_restore = strict_restore
         self.session_keys: set[str] = set()
         self.fwd, self.bwd, self.counters = {}, {}, {}
-        self.rules = [(c, re.compile(p, f), g, v) for c, p, g, v, f in RULES]
+        self.rules = [(c, re.compile(p, f), g, v, req) for c, p, g, v, f, req in RULES]
         self.literals = []
         self.term_rules = []
+        self.term_cats: set[str] = set()
+        self.literals_dirty = False
+        self.terms_dirty = False
+        self._literals_ac = AhoCorasick(case_fold=False)
+        self._terms_ac = AhoCorasick(case_fold=True)
         self.fold = {}              # (category, lowercase text) -> placeholder, for names
         self.lock = threading.RLock()
         self._hits = 0
@@ -268,7 +492,7 @@ class Vault:
     def add_literal(self, value, cat="ENV"):
         if len(value) >= 4:
             self.literals.append((value, cat))
-            self.literals.sort(key=lambda t: -len(t[0]))
+            self.literals_dirty = True
 
     def add_term(self, spec):
         """'Acme Corp' or 'CUSTOMER=Acme Corp' (case-insensitive, whole words)."""
@@ -276,13 +500,13 @@ class Vault:
         cat, text = (m[1], m[2].strip()) if m else ("TERM", spec.strip())
         if not text:
             return
-        rx = re.compile(r"(?<!\w)" + re.escape(text) + r"(?!\w)", re.I)
-        self.term_rules.append((len(text), (cat, rx, 0, None)))
+        self.term_rules.append((_fold_str(text), cat))
+        self.term_cats.add(cat)
+        self.terms_dirty = True
         for k, val in self.fwd.items():         # names already in a loaded map
             m2 = PH_IDX.match(k)
             if m2 and m2[1] == cat:
-                self.fold[(cat, val.lower())] = k
-        self.term_rules.sort(key=lambda t: -t[0])
+                self.fold[(cat, _fold_str(val))] = k
 
     def load_terms(self, path):
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -311,7 +535,7 @@ class Vault:
             k = self.bwd[value]
             self.session_keys.add(k)
             return k
-        fk = (cat, value.lower())
+        fk = (cat, _fold_str(value))
         if fk in self.fold:                     # same name, different capitalisation
             k = self.fold[fk]
             self.session_keys.add(k)
@@ -319,32 +543,63 @@ class Vault:
         n = self.counters[cat] = self.counters.get(cat, 0) + 1
         key = f"[[{cat}_{n}]]"
         self.bwd[value], self.fwd[key] = key, value
-        if any(c == cat for _, (c, *_r) in self.term_rules):
+        if cat in self.term_cats:
             self.fold[fk] = key
         self.session_keys.add(key)
         return key
 
+    def _ensure_literals_ac(self) -> None:
+        if self.literals_dirty:
+            self._literals_ac.build(self.literals)
+            self.literals_dirty = False
+
+    def _ensure_terms_ac(self) -> None:
+        if self.terms_dirty:
+            self._terms_ac.build(self.term_rules)
+            self.terms_dirty = False
+
+    def _replace_ac(self, text: str, ac: AhoCorasick, whole_word: bool) -> str:
+        if not text:
+            return text
+        matches = ac.find_matches(text, whole_word=whole_word)
+        if not matches:
+            return text
+        out, last = [], 0
+        for start, end, cat in matches:
+            out.append(text[last:start])
+            out.append(self.save(text[start:end], cat))
+            last = end
+        out.append(text[last:])
+        return "".join(out)
+
     def _contains_secret(self, text: str) -> bool:
-        for lit, _cat in self.literals:
-            if lit in text:
-                return True
-        for cat, rx, g, val in self.rules:
-            for m in rx.finditer(text):
-                v = m.group(g)
-                if v is None:
-                    continue
-                s, e = m.span(g)
-                if e == s or (val and not val(v)):
-                    continue
-                return True
-        for _, (cat, rx, g, val) in self.term_rules:
-            for m in rx.finditer(text):
-                v = m.group(g)
-                if v is not None and (not val or val(v)):
+        with self.lock:
+            ph_spans = _find_placeholder_spans(text)
+            if self.literals:
+                self._ensure_literals_ac()
+                if self._literals_ac.has_any_match(text, whole_word=False, ph_spans=ph_spans):
                     return True
-        return False
+            features = scan_char_features(text)
+            for cat, rx, g, val, req in self.rules:
+                if (features & req) != req:
+                    continue
+                for m in rx.finditer(text):
+                    v = m.group(g)
+                    if v is None:
+                        continue
+                    s, e = m.span(g)
+                    if e == s or (val and not val(v)):
+                        continue
+                    return True
+            if self.term_rules:
+                self._ensure_terms_ac()
+                if self._terms_ac.has_any_match(text, whole_word=True, ph_spans=ph_spans):
+                    return True
+            return False
 
     def _scan_base64_secrets(self, text: str) -> str:
+        if len(text) < 24:
+            return text
         out, last = [], 0
         for m in B64_CAND.finditer(text):
             cand = m.group(0)
@@ -378,11 +633,17 @@ class Vault:
         """Returns (safe_text, number_of_replacements)."""
         with self.lock:
             before, before_n = self._hits, len(self.fwd)
-            for lit, cat in self.literals:
-                if lit in text:
-                    text = text.replace(lit, self.save(lit, cat))
-            for cat, rx, g, val in self.rules + [r for _, r in self.term_rules]:
+            if self.literals:
+                self._ensure_literals_ac()
+                text = self._replace_ac(text, self._literals_ac, whole_word=False)
+            features = scan_char_features(text)
+            for cat, rx, g, val, req in self.rules:
+                if (features & req) != req:
+                    continue
                 text = self._apply(text, cat, rx, g, val)
+            if self.term_rules:
+                self._ensure_terms_ac()
+                text = self._replace_ac(text, self._terms_ac, whole_word=True)
             text = self._scan_base64_secrets(text)
             text = self._apply_ner(text)
             if len(self.fwd) != before_n:
