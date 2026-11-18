@@ -1,12 +1,16 @@
+import http.client
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -697,6 +701,559 @@ class ApplicationTests(unittest.TestCase):
             )
             self.assertEqual(restore_res.returncode, 0)
             self.assertEqual(restore_res.stdout, payload)
+
+    def test_stream_restorer_chunk_boundaries_and_json_escaping(self):
+        from prosze_cli.broker import StreamRestorer
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            v.add_term("CUSTOMER=Acme Corp")
+            v.add_literal('secret "one"\ntwo\\three', cat="ENV")
+
+            safe, hits = v.redact('Customer Acme Corp and secret "one"\ntwo\\three end.')
+            self.assertEqual(hits, 2)
+            self.assertEqual(safe, "Customer [[CUSTOMER_1]] and [[ENV_1]] end.")
+
+            # Feed 1 character at a time (covers '[', '[[', mid-token, single ']', ']]')
+            sr = StreamRestorer(v)
+            chunks = [sr.feed(ch) for ch in safe]
+            chunks.append(sr.flush())
+            self.assertEqual("".join(chunks), 'Customer Acme Corp and secret "one"\ntwo\\three end.')
+
+            # Non-placeholder brackets and over-60-char partial sequences do not stall stream
+            sr2 = StreamRestorer(v)
+            self.assertEqual(sr2.feed("arr[0] "), "arr[0] ")
+            self.assertEqual(sr2.feed("[[not_ph "), "[[not_ph ")
+            self.assertEqual(sr2.feed("[[A_1] x "), "[[A_1] x ")
+            long_open = "[[" + ("A" * 65)
+            out_long = sr2.feed(long_open)
+            self.assertEqual(out_long, long_open)
+            self.assertEqual(sr2.feed("tail [["), "tail ")
+            self.assertEqual(sr2.flush(), "[[")
+
+            # json_escaped=True produces valid escaped JSON across split boundaries
+            sr_json = StreamRestorer(v, json_escaped=True)
+            json_safe = '{"text":"[[CUSTOMER_1]]: [[ENV_1]]"}'
+            j_parts = [sr_json.feed(json_safe[:15]), sr_json.feed(json_safe[15:26]), sr_json.feed(json_safe[26:])]
+            j_parts.append(sr_json.flush())
+            parsed = json.loads("".join(j_parts))
+            self.assertEqual(parsed["text"], 'Acme Corp: secret "one"\ntwo\\three')
+
+            # strict_restore=True blocks unredacted pre-loaded placeholders
+            v_strict = Vault(str(Path(directory) / "strict_map.tsv"), strict_restore=True)
+            v_strict._ner_attempted = True
+            v_strict.fwd["[[TOKEN_1]]"] = "hidden-token"
+            v_strict.bwd["hidden-token"] = "[[TOKEN_1]]"
+            v_strict.add_term("CUSTOMER=Acme Corp")
+            v_strict.redact("Acme Corp")
+            sr_strict = StreamRestorer(v_strict)
+            strict_out = sr_strict.feed("[[CUSTOMER") + sr_strict.feed("_1]] and [[TOKEN") + sr_strict.feed("_1]]") + sr_strict.flush()
+            self.assertEqual(strict_out, "Acme Corp and [[TOKEN_1]]")
+
+    def test_sse_restorer_split_events_and_preservation(self):
+        from prosze_cli.broker import SSERestorer
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            v.add_term("CUSTOMER=Acme Corp")
+            safe_prompt, _ = v.redact("Contact Acme Corp via alice@example.com")
+            self.assertIn("[[CUSTOMER_1]]", safe_prompt)
+            self.assertIn("[[EMAIL_1]]", safe_prompt)
+
+            # OpenAI JSON SSE with split placeholders and arbitrary chunk splits
+            sse_stream = (
+                ": keepalive\n\n"
+                "event: chunk\n"
+                "id: 1\n"
+                "retry: 1000\n"
+                'data: {"id":"cmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hi [["}}]}\n\n'
+                'data: {"id":"cmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"CUSTOMER_1"}}]}\n\n'
+                'data: {"id":"cmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"]] / [["}}]}\n\n'
+                'data: {"id":"cmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"EMAIL_1]]!"}}]}\n\n'
+                "data: [DONE]\n\n"
+            )
+            restorer = SSERestorer(v)
+            pieces = []
+            step = 19
+            for i in range(0, len(sse_stream), step):
+                pieces.append(restorer.feed(sse_stream[i:i + step]))
+            pieces.append(restorer.flush())
+            out = "".join(pieces)
+
+            self.assertIn(": keepalive\n", out)
+            self.assertIn("event: chunk\n", out)
+            self.assertIn("id: 1\n", out)
+            self.assertIn("retry: 1000\n", out)
+            self.assertIn("data: [DONE]\n", out)
+
+            assembled = []
+            for line in out.splitlines():
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    obj = json.loads(line[6:])
+                    assembled.append(obj["choices"][0]["delta"]["content"])
+            self.assertEqual("".join(assembled), "Hi Acme Corp / alice@example.com!")
+
+            # Plain-text SSE with split placeholder + metadata + [DONE]
+            plain_sse = (
+                ": comment\n\n"
+                "event: text\n"
+                "id: 9\n"
+                "data: Tell [[\n\n"
+                "data: CUSTOMER_1\n\n"
+                "data: ]] now\n\n"
+                "data: [DONE]\n\n"
+            )
+            plain_restorer = SSERestorer(v)
+            plain_out = plain_restorer.feed(plain_sse) + plain_restorer.flush()
+            self.assertIn(": comment\n", plain_out)
+            self.assertIn("event: text\n", plain_out)
+            self.assertIn("id: 9\n", plain_out)
+            self.assertIn("data: [DONE]\n", plain_out)
+            plain_data = "".join(
+                line[6:] for line in plain_out.splitlines() if line.startswith("data: ") and line != "data: [DONE]"
+            )
+            self.assertEqual(plain_data, "Tell Acme Corp now")
+
+            # Anthropic content_block_delta + trailing incomplete prefix flushed before [DONE]
+            ant_sse = (
+                "event: content_block_delta\n"
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi [["}}\n\n'
+                "event: content_block_delta\n"
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CUSTOMER_1]] and [[PARTIAL"}}\n\n'
+                "data: [DONE]\n\n"
+            )
+            ant_restorer = SSERestorer(v)
+            ant_out = ant_restorer.feed(ant_sse) + ant_restorer.flush()
+            self.assertIn("event: content_block_delta\n", ant_out)
+            self.assertIn("data: [DONE]\n", ant_out)
+            ant_text = "".join(
+                json.loads(line[6:])["delta"]["text"]
+                for line in ant_out.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"
+            )
+            self.assertEqual(ant_text, "Hi Acme Corp and [[PARTIAL")
+            self.assertLess(ant_out.index("[[PARTIAL"), ant_out.index("data: [DONE]"))
+
+    def test_broker_validation_and_loopback_guards(self):
+        from prosze_cli.broker import create_broker_server
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory, ephemeral=True)
+
+            # Non-loopback hosts rejected unless allow_remote=True
+            for bad_host in ("0.0.0.0", "192.168.1.50", "10.0.0.5", ""):
+                with self.assertRaises(ValueError):
+                    create_broker_server(v, host=bad_host, port=0)
+
+            # allow_remote=True permits non-loopback
+            remote_srv = create_broker_server(v, host="0.0.0.0", port=0, allow_remote=True)
+            remote_srv.server_close()
+
+            # Loopback hosts allowed by default
+            for ok_host in ("127.0.0.1", "localhost", "::1"):
+                srv = create_broker_server(v, host=ok_host, port=0)
+                srv.server_close()
+
+            # Invalid upstream URLs rejected
+            for bad_upstream in ("ftp://example.com", "file:///etc/passwd", "https://", "not-a-url", ""):
+                with self.assertRaises(ValueError):
+                    create_broker_server(v, host="127.0.0.1", port=0, upstream=bad_upstream)
+
+    def _start_dummy_upstream(self, handler_cls):
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def _start_broker(self, vault, upstream_url):
+        from prosze_cli.broker import create_broker_server
+
+        broker = create_broker_server(vault, host="127.0.0.1", port=0, upstream=upstream_url)
+        thread = threading.Thread(target=broker.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(broker.server_close)
+        self.addCleanup(broker.shutdown)
+        return broker
+
+    def test_broker_gateway_json_text_and_sse_roundtrip(self):
+        captured_requests = []
+
+        class DummyUpstreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                captured_requests.append({
+                    "method": "POST",
+                    "path": self.path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "body": body,
+                })
+
+                if self.path == "/v1/chat/completions":
+                    payload = json.loads(body.decode("utf-8"))
+                    if payload.get("stream"):
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        events = [
+                            ": stream-open\n\n",
+                            'data: {"id":"1","choices":[{"index":0,"delta":{"content":"Hello [["}}]}\n\n',
+                            'data: {"id":"1","choices":[{"index":0,"delta":{"content":"CUSTOMER_1"}}]}\n\n',
+                            'data: {"id":"1","choices":[{"index":0,"delta":{"content":"]] & [["}}]}\n\n',
+                            'data: {"id":"1","choices":[{"index":0,"delta":{"content":"EMAIL_1]]"}}]}\n\n',
+                            "data: [DONE]\n\n",
+                        ]
+                        for ev in events:
+                            self.wfile.write(ev.encode("utf-8"))
+                            self.wfile.flush()
+                        self.close_connection = True
+                        return
+
+                    resp_obj = {
+                        "id": "cmpl-test",
+                        "object": "chat.completion",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Ack [[CUSTOMER_1]] / [[EMAIL_1]] / [[TOKEN_1]] / [[ENV_1]]"}}],
+                    }
+                    resp_bytes = json.dumps(resp_obj).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp_bytes)))
+                    self.end_headers()
+                    self.wfile.write(resp_bytes)
+                    return
+
+                if self.path == "/v1/text":
+                    resp_bytes = f"Upstream saw: {body.decode('utf-8')}".encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(resp_bytes)))
+                    self.end_headers()
+                    self.wfile.write(resp_bytes)
+
+        upstream = self._start_dummy_upstream(DummyUpstreamHandler)
+        upstream_url = f"http://127.0.0.1:{upstream.server_port}"
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            v.add_term("CUSTOMER=Acme Corp")
+            v.add_literal('quote"secret\nline2', cat="ENV")
+            broker = self._start_broker(v, upstream_url)
+            b_host, b_port = broker.server_address
+
+            # 1. JSON request/response round-trip + hop-by-hop & Accept-Encoding checks
+            conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+            req_body = json.dumps({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": 'Ask Acme Corp (alice@example.com, sk-proj-abcdef1234567890) about quote"secret\nline2'}],
+                "attachment": {"type": "base64", "data": "keep-raw-base64"},
+            }).encode("utf-8")
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=req_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept-Encoding": "gzip, br",
+                    "Connection": "keep-alive, x-custom-hop",
+                    "Keep-Alive": "timeout=5",
+                    "Proxy-Connection": "keep-alive",
+                    "X-Custom-Hop": "drop-me",
+                    "Authorization": "Bearer public-test-header",
+                },
+            )
+            resp = conn.getresponse()
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            conn.close()
+
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(
+                resp_data["choices"][0]["message"]["content"],
+                'Ack Acme Corp / alice@example.com / sk-proj-abcdef1234567890 / quote"secret\nline2',
+            )
+
+            up_req = captured_requests[-1]
+            up_body_text = up_req["body"].decode("utf-8")
+            self.assertNotIn("Acme Corp", up_body_text)
+            self.assertNotIn("alice@example.com", up_body_text)
+            self.assertNotIn("sk-proj-abcdef1234567890", up_body_text)
+            self.assertIn("[[CUSTOMER_1]]", up_body_text)
+            self.assertIn("[[EMAIL_1]]", up_body_text)
+            self.assertIn("[[TOKEN_1]]", up_body_text)
+            self.assertIn("[[ENV_1]]", up_body_text)
+            up_json = json.loads(up_body_text)
+            self.assertEqual(up_json["model"], "gpt-4o")
+            self.assertEqual(up_json["attachment"]["data"], "keep-raw-base64")
+            self.assertEqual(up_req["headers"].get("accept-encoding"), "identity")
+            self.assertNotIn("keep-alive", up_req["headers"])
+            self.assertNotIn("proxy-connection", up_req["headers"])
+            self.assertNotIn("x-custom-hop", up_req["headers"])
+
+            # 2. Plain text request/response round-trip
+            conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+            conn.request(
+                "POST",
+                "/v1/text",
+                body=b"Notify alice@example.com at Acme Corp",
+                headers={"Content-Type": "text/plain"},
+            )
+            t_resp = conn.getresponse()
+            t_body = t_resp.read().decode("utf-8")
+            conn.close()
+            self.assertEqual(t_resp.status, 200)
+            self.assertEqual(t_body, "Upstream saw: Notify alice@example.com at Acme Corp")
+            self.assertEqual(captured_requests[-1]["body"], b"Notify [[EMAIL_1]] at [[CUSTOMER_1]]")
+
+            # 2b. Chunked Transfer-Encoding request body redaction round-trip
+            chunk_payload = b"Chunk secret: alice@example.com"
+            with socket.create_connection((b_host, b_port), timeout=5) as sock:
+                raw_chunked_req = (
+                    b"POST /v1/text HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"Connection: close\r\n\r\n"
+                    + f"{len(chunk_payload):x}\r\n".encode("ascii")
+                    + chunk_payload
+                    + b"\r\n0\r\n\r\n"
+                )
+                sock.sendall(raw_chunked_req)
+                raw_chunked_resp = b""
+                while True:
+                    part = sock.recv(4096)
+                    if not part:
+                        break
+                    raw_chunked_resp += part
+            self.assertIn(b"200 OK", raw_chunked_resp)
+            self.assertIn(b"Upstream saw: Chunk secret: alice@example.com", raw_chunked_resp)
+            self.assertEqual(captured_requests[-1]["body"], b"Chunk secret: [[EMAIL_1]]")
+
+            # 3. SSE streaming round-trip
+            conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps({"model": "gpt-4o", "stream": True, "messages": [{"role": "user", "content": "Hi Acme Corp"}]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            s_resp = conn.getresponse()
+            sse_raw = s_resp.read().decode("utf-8")
+            conn.close()
+            self.assertEqual(s_resp.status, 200)
+            self.assertIn(": stream-open", sse_raw)
+            self.assertIn("data: [DONE]", sse_raw)
+            sse_content = "".join(
+                json.loads(line[6:])["choices"][0]["delta"]["content"]
+                for line in sse_raw.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"
+            )
+            self.assertEqual(sse_content, "Hello Acme Corp & alice@example.com")
+
+            # 4. Bounded history metadata check (no raw secrets, max 100 entries)
+            self.assertGreaterEqual(len(broker.history), 3)
+            for entry in broker.history:
+                self.assertEqual(set(entry.keys()), {"method", "path", "status", "redacted_count", "latency_ms"})
+                self.assertGreaterEqual(entry["latency_ms"], 0.0)
+            history_dump = json.dumps(broker.history)
+            self.assertNotIn("Acme Corp", history_dump)
+            self.assertNotIn("alice@example.com", history_dump)
+            self.assertNotIn("sk-proj-abcdef1234567890", history_dump)
+            self.assertEqual(broker.history[0]["redacted_count"], 4)
+
+            for _ in range(105):
+                conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+                conn.request("POST", "/v1/text", body=b"plain text", headers={"Content-Type": "text/plain"})
+                r = conn.getresponse()
+                r.read()
+                conn.close()
+            self.assertEqual(len(broker.history), 100)
+
+            # 5. Concurrent requests remain thread-safe on vault + bounded history
+            def worker(idx):
+                c = http.client.HTTPConnection(b_host, b_port, timeout=5)
+                c.request(
+                    "POST",
+                    "/v1/text",
+                    body=f"Worker {idx} for Acme Corp".encode("utf-8"),
+                    headers={"Content-Type": "text/plain"},
+                )
+                w_resp = c.getresponse()
+                w_body = w_resp.read().decode("utf-8")
+                c.close()
+                self.assertEqual(w_resp.status, 200)
+                self.assertEqual(w_body, f"Upstream saw: Worker {idx} for Acme Corp")
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(12)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=5)
+                self.assertFalse(th.is_alive())
+            self.assertEqual(len(broker.history), 100)
+            self.assertNotIn("Acme Corp", json.dumps(broker.history))
+
+    def test_broker_gateway_framing_size_and_compressed_502_guards(self):
+        upstream_hits = 0
+
+        class GuardDummyUpstream(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):
+                return
+
+            def do_POST(self):
+                nonlocal upstream_hits
+                upstream_hits += 1
+                length = int(self.headers.get("Content-Length", "0"))
+                _ = self.rfile.read(length)
+                if self.path == "/compressed":
+                    body = b"\x1f\x8b\x08\x00fake-gzip"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Encoding", "identity")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        upstream = self._start_dummy_upstream(GuardDummyUpstream)
+        upstream_url = f"http://127.0.0.1:{upstream.server_port}"
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            broker = self._start_broker(v, upstream_url)
+            b_host, b_port = broker.server_address
+
+            # 1. Both Content-Length and Transfer-Encoding -> 400 Bad Request
+            with socket.create_connection((b_host, b_port), timeout=5) as sock:
+                raw_req = (
+                    b"POST /v1/chat/completions HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Length: 5\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b"0\r\n\r\n"
+                )
+                sock.sendall(raw_req)
+                raw_resp = sock.recv(4096).decode("utf-8", "replace")
+            self.assertTrue(raw_resp.startswith("HTTP/1.1 400 ") or raw_resp.startswith("HTTP/1.0 400 "))
+            self.assertEqual(upstream_hits, 0)
+
+            # 2. > 16 MiB Content-Length -> 413 Payload Too Large
+            over_cap = (16 * 1024 * 1024) + 1
+            with socket.create_connection((b_host, b_port), timeout=5) as sock:
+                raw_req = (
+                    f"POST /v1/chat/completions HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1\r\n"
+                    f"Content-Length: {over_cap}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                sock.sendall(raw_req)
+                raw_resp = sock.recv(4096).decode("utf-8", "replace")
+            self.assertTrue(raw_resp.startswith("HTTP/1.1 413 ") or raw_resp.startswith("HTTP/1.0 413 "))
+            self.assertEqual(upstream_hits, 0)
+
+            # 3. Compressed upstream Content-Encoding -> 502 Bad Gateway
+            conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+            conn.request("POST", "/compressed", body=b'{"x":1}', headers={"Content-Type": "application/json"})
+            c_resp = conn.getresponse()
+            c_resp.read()
+            conn.close()
+            self.assertEqual(c_resp.status, 502)
+
+            # 4. Identity upstream Content-Encoding -> 200 OK
+            conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+            conn.request("POST", "/identity", body=b'{"x":1}', headers={"Content-Type": "application/json"})
+            i_resp = conn.getresponse()
+            i_body = i_resp.read()
+            conn.close()
+            self.assertEqual(i_resp.status, 200)
+            self.assertEqual(i_body, b'{"ok":true}')
+
+            # 5. Chunked Transfer-Encoding exceeding 16 MiB -> 413 Payload Too Large
+            over_chunk_hex = f"{(16 * 1024 * 1024) + 1:x}"
+            with socket.create_connection((b_host, b_port), timeout=5) as sock:
+                raw_req = (
+                    f"POST /v1/chat/completions HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1\r\n"
+                    f"Transfer-Encoding: chunked\r\n"
+                    f"Connection: close\r\n\r\n"
+                    f"{over_chunk_hex}\r\n"
+                ).encode("ascii")
+                sock.sendall(raw_req)
+                raw_resp = sock.recv(4096).decode("utf-8", "replace")
+            self.assertTrue(raw_resp.startswith("HTTP/1.1 413 ") or raw_resp.startswith("HTTP/1.0 413 "))
+
+            # 6. Unreachable upstream -> 502 Bad Gateway
+            closed_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            closed_sock.bind(("127.0.0.1", 0))
+            dead_port = closed_sock.getsockname()[1]
+            closed_sock.close()
+            dead_broker = self._start_broker(v, f"http://127.0.0.1:{dead_port}")
+            d_host, d_port = dead_broker.server_address
+            conn = http.client.HTTPConnection(d_host, d_port, timeout=5)
+            conn.request("GET", "/v1/models")
+            d_resp = conn.getresponse()
+            d_resp.read()
+            conn.close()
+            self.assertEqual(d_resp.status, 502)
+
+    def test_cli_broker_serve_help_and_dispatch(self):
+        command = [sys.executable, "-m", "prosze_cli"]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PACKAGE_DIR)
+
+        help_res = subprocess.run(
+            command + ["broker", "serve", "--help"],
+            cwd=PACKAGE_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(help_res.returncode, 0)
+        self.assertIn("--listen", help_res.stdout)
+        self.assertIn("--upstream", help_res.stdout)
+        self.assertIn("--allow-remote", help_res.stdout)
+        self.assertIn("--ephemeral", help_res.stdout)
+
+        err_buf = io.StringIO()
+        with patch("sys.stderr", new=err_buf), patch("prosze_cli.broker.BrokerGateway.serve_forever") as mock_serve:
+            cli_main([
+                "broker", "serve",
+                "--listen", "127.0.0.1:0",
+                "--upstream", "http://127.0.0.1:9999",
+                "--no-ner",
+                "--ephemeral",
+            ])
+        mock_serve.assert_called_once()
+        self.assertIn("prosze broker listening on http://127.0.0.1:", err_buf.getvalue())
+
+        bad_err = io.StringIO()
+        with patch("sys.stderr", new=bad_err), self.assertRaises(SystemExit) as cm:
+            cli_main([
+                "broker", "serve",
+                "--listen", "0.0.0.0:8787",
+                "--no-ner",
+                "--ephemeral",
+            ])
+        self.assertNotEqual(cm.exception.code, 0)
+        self.assertIn("refusing non-loopback listen host", bad_err.getvalue())
 
 
 if __name__ == "__main__":

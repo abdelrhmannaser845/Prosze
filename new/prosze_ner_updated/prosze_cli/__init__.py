@@ -112,6 +112,28 @@ def cmd_run(v: Vault, cmd: list[str]) -> None:
     sys.exit(res.returncode)
 
 
+def cmd_broker_serve(
+    v: Vault,
+    listen: str = "127.0.0.1:8787",
+    upstream: str = "https://api.openai.com",
+    allow_remote: bool = False,
+) -> None:
+    from prosze_cli.broker import create_broker_server, parse_listen_addr
+
+    host, port = parse_listen_addr(listen)
+    server = create_broker_server(v, host=host, port=port, upstream=upstream, allow_remote=allow_remote)
+    bound_host, bound_port = server.server_address[0], server.server_address[1]
+    display_host = f"[{bound_host}]" if ":" in bound_host else bound_host
+    sys.stderr.write(f"prosze broker listening on http://{display_host}:{bound_port} -> {upstream}\n")
+    sys.stderr.flush()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 # ---- CLI ----------------------------------------------------------------
 def cli_main(argv: Optional[list[str]] = None) -> None:
     if argv is None:
@@ -134,10 +156,37 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
     for name in ("chat", "redact", "restore", "check", "run"):
         sub.add_parser(name, parents=[common])
 
+    broker_parser = sub.add_parser("broker", help="privacy broker gateways and wrappers")
+    broker_sub = broker_parser.add_subparsers(dest="broker_cmd")
+    serve_parser = broker_sub.add_parser(
+        "serve",
+        parents=[common],
+        help="run local HTTP/SSE privacy gateway",
+    )
+    serve_parser.add_argument(
+        "--listen",
+        default="127.0.0.1:8787",
+        help="listen address host:port (default: 127.0.0.1:8787)",
+    )
+    serve_parser.add_argument(
+        "--upstream",
+        default="https://api.openai.com",
+        help="upstream AI API base URL (default: https://api.openai.com)",
+    )
+    serve_parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow binding to non-loopback hosts",
+    )
+
     a = ap.parse_args(cli_args)
     if not a.cmd:
         ap.print_help()
         return
+    if a.cmd == "broker" and not getattr(a, "broker_cmd", None):
+        broker_parser.print_help()
+        return
+
     try:
         v = build_vault(a)
     except ValueError as exc:
@@ -154,6 +203,17 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         cmd_check(v)
     elif a.cmd == "run":
         cmd_run(v, cmd)
+    elif a.cmd == "broker" and a.broker_cmd == "serve":
+        try:
+            cmd_broker_serve(
+                v,
+                listen=a.listen,
+                upstream=a.upstream,
+                allow_remote=a.allow_remote,
+            )
+        except ValueError as exc:
+            sys.stderr.write(f"{exc}\n")
+            sys.exit(1)
     else:
         ap.print_help()
 
