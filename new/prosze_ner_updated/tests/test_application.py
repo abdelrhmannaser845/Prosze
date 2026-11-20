@@ -1,3 +1,4 @@
+import base64
 import gzip
 import http.client
 import io
@@ -666,6 +667,49 @@ class ApplicationTests(unittest.TestCase):
             self.assertIn("[[EMAIL_1]]", cap_out.getvalue())
             self.assertNotIn("mail@example.com", cap_out.getvalue())
 
+    def test_unclosed_privkey_redacted_everywhere_including_stream_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            unclosed = (
+                "-----BEGIN PRIVATE KEY-----\n"
+                "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+                "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMk"
+            )
+
+            self.assertTrue(v._contains_secret(unclosed))
+
+            safe, hits = v.redact("Key:\n" + unclosed)
+            self.assertEqual(hits, 1)
+            self.assertEqual(safe, "Key:\n[[PRIVKEY_1]]")
+            self.assertEqual(v.restore(safe), "Key:\n" + unclosed)
+
+            # Base64-encoded unclosed private key also detected and redacted
+            b64_unclosed = base64.b64encode(unclosed.encode("utf-8")).decode("ascii")
+            safe_b64, hits_b64 = v.redact(f"Encoded: {b64_unclosed}")
+            self.assertEqual(hits_b64, 1)
+            self.assertEqual(safe_b64, "Encoded: [[ENCODED_1]]")
+            self.assertEqual(v.restore(safe_b64), f"Encoded: {b64_unclosed}")
+
+            # Small unclosed block across redact_stream
+            v_small = self.make_vault(directory)
+            small_out = io.StringIO()
+            small_hits = v_small.redact_stream(io.StringIO("Key:\n" + unclosed), small_out, chunk_size=32)
+            self.assertEqual(small_hits, 1)
+            self.assertEqual(small_out.getvalue(), "Key:\n[[PRIVKEY_1]]")
+
+            # > 64 KB truncated unclosed PEM block across redact_stream still redacts the captured block
+            cap_payload = "-----BEGIN PRIVATE KEY-----\n" + ("A" * 64 + "\n") * 1150 + "tail mail@example.com"
+            v_cap = Vault(str(Path(directory) / "unclosed_cap_map.tsv"))
+            v_cap._ner_attempted = True
+            cap_out = io.StringIO()
+            cap_hits = v_cap.redact_stream(io.StringIO(cap_payload), cap_out, chunk_size=4096)
+            cap_text = cap_out.getvalue()
+            self.assertGreaterEqual(cap_hits, 2)
+            self.assertIn("[[PRIVKEY_1]]", cap_text)
+            self.assertNotIn("-----BEGIN PRIVATE KEY-----", cap_text)
+            self.assertIn("[[EMAIL_1]]", cap_text)
+            self.assertNotIn("mail@example.com", cap_text)
+
     def test_cli_stream_flag(self):
         with tempfile.TemporaryDirectory() as directory:
             map_path = Path(directory) / "map.tsv"
@@ -1264,6 +1308,100 @@ class ApplicationTests(unittest.TestCase):
                 raw_te_resp = sock.recv(4096).decode("utf-8", "replace")
             self.assertTrue(raw_te_resp.startswith("HTTP/1.1 400 ") or raw_te_resp.startswith("HTTP/1.0 400 "))
             self.assertEqual(upstream_hits, hits_before_te)
+
+    def test_broker_gateway_fail_closed_on_malformed_json_nul_and_invalid_utf8(self):
+        upstream_requests = []
+
+        class NeverReachedUpstream(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                upstream_requests.append({
+                    "path": self.path,
+                    "content_type": self.headers.get("Content-Type", ""),
+                    "body": body,
+                })
+                resp_body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
+
+        upstream = self._start_dummy_upstream(NeverReachedUpstream)
+        upstream_url = f"http://127.0.0.1:{upstream.server_port}"
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory)
+            broker = self._start_broker(v, upstream_url)
+            b_host, b_port = broker.server_address
+
+            bad_cases = [
+                # Malformed JSON (valid UTF-8)
+                ({"Content-Type": "application/json"}, b'{"prompt":"alice@example.com"'),
+                ({"Content-Type": "application/problem+json; charset=utf-8"}, b'not-json alice@example.com'),
+                # NUL-containing JSON
+                ({"Content-Type": "application/json"}, b'{"prompt":"alice@example.com\x00"}'),
+                ({"Content-Type": "application/json"}, b'{"prompt":"alice@example.com"}\x00'),
+                ({"Content-Type": "application/vnd.api+json"}, b'{"prompt":"alice@example.com\x00"}'),
+                # Invalid UTF-8 JSON (e.g. Latin-1 0xe9)
+                ({"Content-Type": "application/json"}, b'{"prompt":"caf\xe9 alice@example.com"}'),
+                ({"Content-Type": "application/ld+json"}, b'\xe9{"prompt":"alice@example.com"}'),
+                # Typeless bodies (no Content-Type) with NUL or invalid UTF-8
+                ({}, b'alice@example.com\x00'),
+                ({}, b'caf\xe9 alice@example.com'),
+                # text/* bodies with NUL or invalid UTF-8
+                ({"Content-Type": "text/plain; charset=utf-8"}, b'alice@example.com\x00'),
+                ({"Content-Type": "text/plain"}, b'caf\xe9 alice@example.com'),
+            ]
+
+            for headers, body in bad_cases:
+                with self.subTest(headers=headers, body=body):
+                    conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+                    conn.request("POST", "/v1/chat/completions", body=body, headers=headers)
+                    resp = conn.getresponse()
+                    resp_raw = resp.read()
+                    conn.close()
+                    self.assertEqual(
+                        resp.status,
+                        400,
+                        msg=f"Expected 400 for headers={headers!r}, body={body!r}, got {resp.status} ({resp_raw!r})",
+                    )
+                    err_obj = json.loads(resp_raw.decode("utf-8"))
+                    self.assertEqual(err_obj["error"]["status"], 400)
+
+            # Duplicate / conflicting Content-Type headers -> 400
+            conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+            dup_body = b'{"prompt":"alice@example.com"}'
+            conn.putrequest("POST", "/v1/chat/completions")
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", str(len(dup_body)))
+            conn.endheaders(dup_body)
+            dup_resp = conn.getresponse()
+            dup_resp.read()
+            conn.close()
+            self.assertEqual(dup_resp.status, 400)
+
+            self.assertEqual(upstream_requests, [])
+            self.assertEqual(len(v.fwd), 0)
+            self.assertEqual(len(broker.history), len(bad_cases) + 1)
+            self.assertTrue(all(h["status"] == 400 and h["redacted_count"] == 0 for h in broker.history))
+
+            # Valid UTF-8 typeless body still succeeds and is redacted before reaching upstream
+            conn = http.client.HTTPConnection(b_host, b_port, timeout=5)
+            conn.request("POST", "/v1/chat/completions", body=b"Contact alice@example.com", headers={})
+            ok_resp = conn.getresponse()
+            ok_resp.read()
+            conn.close()
+            self.assertEqual(ok_resp.status, 200)
+            self.assertEqual(len(upstream_requests), 1)
+            self.assertEqual(upstream_requests[0]["body"], b"Contact [[EMAIL_1]]")
 
     def test_cli_broker_serve_help_and_dispatch(self):
         command = [sys.executable, "-m", "prosze_cli"]

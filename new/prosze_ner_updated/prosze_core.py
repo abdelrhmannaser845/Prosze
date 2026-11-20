@@ -325,7 +325,7 @@ class AhoCorasick:
 
 RULES = [
     # (category, regex, group, validator, flags, required_features)
-    ("PRIVKEY", r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\\Z)", 0, None, re.S, FEAT_DASH_UNDER),
+    ("PRIVKEY", r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", 0, None, re.S, FEAT_DASH_UNDER),
     ("PASSWORD", r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+:([^\s@/]+)@", 1, not_placeholder, 0, FEAT_AT | FEAT_COLON_EQ),
     ("EMAIL", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", 0, None, 0, FEAT_AT | FEAT_DOT),
     ("TOKEN", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", 0, None, 0, FEAT_NONE),

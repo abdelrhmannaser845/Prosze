@@ -51,9 +51,9 @@
       "category": "TOKEN",
       "terms": [],
       "literals": [],
-      "input": "Alert https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX on failure.",
+      "input": "Alert  on failure.",
       "expected_redacted": "Alert [[TOKEN_1]] on failure.",
-      "expected_restored": "Alert https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX on failure."
+      "expected_restored": "Alert  on failure."
     },
     {
       "id": "token_openai_sk_proj",

@@ -580,14 +580,13 @@ class BrokerRequestHandler(BaseHTTPRequestHandler):
         vault = self.server.vault
 
         if _is_json_content_type(mime):
+            if b"\x00" in raw_body:
+                raise ValueError("Malformed JSON request body: NUL byte not allowed")
             try:
                 text = raw_body.decode("utf-8")
                 payload = json.loads(text)
-            except (UnicodeDecodeError, ValueError):
-                if _is_utf8_printable_or_text(raw_body):
-                    safe_text, hits = vault.redact(raw_body.decode("utf-8"))
-                    return safe_text.encode("utf-8"), hits
-                return raw_body, 0
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ValueError("Invalid UTF-8 or malformed JSON request body") from exc
 
             redacted_count = 0
 
@@ -600,8 +599,10 @@ class BrokerRequestHandler(BaseHTTPRequestHandler):
             safe_payload = prosze_core.walk(payload, _redact_str)
             return json.dumps(safe_payload, ensure_ascii=False).encode("utf-8"), redacted_count
 
-        if _is_text_content_type(mime) or (not mime and _is_utf8_printable_or_text(raw_body)):
-            safe_text, hits = vault.redact(raw_body.decode("utf-8", "replace"))
+        if _is_text_content_type(mime) or not mime:
+            if not _is_utf8_printable_or_text(raw_body):
+                raise ValueError("Invalid UTF-8 or NUL byte in request body")
+            safe_text, hits = vault.redact(raw_body.decode("utf-8"))
             return safe_text.encode("utf-8"), hits
 
         return raw_body, 0
@@ -732,8 +733,18 @@ class BrokerRequestHandler(BaseHTTPRequestHandler):
             finish(415)
             return
 
-        req_ct = self.headers.get("Content-Type", "")
-        forwarded_body, redacted_count = self._redact_request_body(raw_body, req_ct)
+        ct_vals = self.headers.get_all("Content-Type") or []
+        if len(ct_vals) > 1:
+            self._send_error_json(400, "Conflicting Content-Type headers")
+            finish(400)
+            return
+        req_ct = ct_vals[0] if ct_vals else ""
+        try:
+            forwarded_body, redacted_count = self._redact_request_body(raw_body, req_ct)
+        except ValueError as exc:
+            self._send_error_json(400, str(exc))
+            finish(400)
+            return
 
         has_body = bool(forwarded_body) or (
             self.command in ("POST", "PUT", "PATCH")
