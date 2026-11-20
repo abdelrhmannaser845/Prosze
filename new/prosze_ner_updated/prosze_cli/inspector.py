@@ -770,6 +770,54 @@ def _build_status_payload(vault: prosze_core.Vault, gateway: Any) -> dict[str, A
     }
 
 
+def _extract_host_hostname(raw_host: str) -> Optional[str]:
+    h = (raw_host or "").strip()
+    if not h or any(ch.isspace() for ch in h) or "@" in h or "/" in h:
+        return None
+    if h.startswith("["):
+        end_bracket = h.find("]")
+        if end_bracket == -1:
+            return None
+        hostname = h[1:end_bracket]
+        rest = h[end_bracket + 1:]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                return None
+            port = int(rest[1:])
+            if not (0 <= port <= 65535):
+                return None
+        return hostname
+    if h.count(":") == 1:
+        hostname, port_str = h.rsplit(":", 1)
+        if not port_str.isdigit() or not (0 <= int(port_str) <= 65535):
+            return None
+        return hostname
+    return h
+
+
+def _is_allowed_loopback_origin(raw_origin: str, expected_port: int) -> bool:
+    s = (raw_origin or "").strip()
+    if not s or s.lower() == "null" or any(ch.isspace() for ch in s):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(s)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    try:
+        origin_port = parsed.port
+    except ValueError:
+        return False
+    if origin_port is not None and expected_port and origin_port != expected_port:
+        return False
+    if not parsed.hostname:
+        return False
+    return is_loopback_host(parsed.hostname)
+
+
 class InspectorRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the local Cloakroom Ticket web inspector."""
 
@@ -811,6 +859,31 @@ class InspectorRequestHandler(BaseHTTPRequestHandler):
     def _send_error_json(self, status: int, message: str) -> None:
         self._send_json(status, {"error": {"message": message, "status": status}}, close=True)
 
+    def _validate_request_origin_and_host(self) -> bool:
+        host_vals = self.headers.get_all("Host") or []
+        if len(host_vals) != 1:
+            self._send_error_json(403, "Forbidden: valid loopback Host header required")
+            return False
+        hostname = _extract_host_hostname(host_vals[0])
+        if not hostname or not is_loopback_host(hostname):
+            self._send_error_json(403, "Forbidden: non-loopback Host header rejected")
+            return False
+
+        for raw_sfs in self.headers.get_all("Sec-Fetch-Site") or []:
+            if raw_sfs.strip().lower() == "cross-site":
+                self._send_error_json(403, "Forbidden: cross-site request rejected")
+                return False
+
+        origin_vals = self.headers.get_all("Origin") or []
+        if origin_vals:
+            if len(origin_vals) != 1 or not _is_allowed_loopback_origin(
+                origin_vals[0], getattr(self.server, "server_port", 0)
+            ):
+                self._send_error_json(403, "Forbidden: cross-origin request rejected")
+                return False
+
+        return True
+
     def _read_json_text(self) -> tuple[Optional[str], int, str]:
         raw_body, err_status, err_msg = read_http_request_body(
             self.headers, self.rfile, max_bytes=MAX_REQUEST_BYTES
@@ -819,6 +892,12 @@ class InspectorRequestHandler(BaseHTTPRequestHandler):
             return None, err_status, err_msg
         if has_compressed_encoding(self.headers):
             return None, 415, "Unsupported Content-Encoding; only identity is allowed"
+        ct_vals = self.headers.get_all("Content-Type") or []
+        if len(ct_vals) != 1:
+            return None, 415, "Unsupported Content-Type; application/json required"
+        mime = ct_vals[0].split(";", 1)[0].strip().lower()
+        if mime != "application/json":
+            return None, 415, "Unsupported Content-Type; application/json required"
         assert raw_body is not None
         try:
             text_body = raw_body.decode("utf-8")
@@ -836,6 +915,8 @@ class InspectorRequestHandler(BaseHTTPRequestHandler):
         return urllib.parse.urlsplit(self.path).path or "/"
 
     def do_GET(self) -> None:
+        if not self._validate_request_origin_and_host():
+            return
         path = self._route_path()
         if path == "/":
             self._send_bytes(200, "text/html; charset=utf-8", _INSPECTOR_HTML)
@@ -849,6 +930,8 @@ class InspectorRequestHandler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def do_POST(self) -> None:
+        if not self._validate_request_origin_and_host():
+            return
         path = self._route_path()
         if path not in ("/api/redact", "/api/restore"):
             if path in _KNOWN_PATHS:
@@ -880,6 +963,8 @@ class InspectorRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"restored_text": restored_text})
 
     def _handle_unsupported_method(self) -> None:
+        if not self._validate_request_origin_and_host():
+            return
         path = self._route_path()
         if path in _KNOWN_PATHS:
             self._send_error_json(405, "Method not allowed")

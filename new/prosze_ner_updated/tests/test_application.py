@@ -2370,6 +2370,141 @@ class ApplicationTests(unittest.TestCase):
             conn.close()
             self.assertEqual(solo_rs["restored_text"], "Blocked [[TOKEN_9]]")
 
+    def test_inspector_dns_rebinding_and_csrf_guards(self):
+        from prosze_cli.inspector import create_inspector_server
+
+        with tempfile.TemporaryDirectory() as directory:
+            map_path = Path(directory) / "csrf_map.tsv"
+            v = Vault(str(map_path), ephemeral=False)
+            v._ner_attempted = True
+            v.redact("Seed secret seed.user@example.com")
+            initial_map = map_path.read_text(encoding="utf-8")
+
+            server = create_inspector_server(v, host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            host, port = server.server_address
+
+            def send_raw(method, path, headers, body=b""):
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(method, path, body=body, headers=headers)
+                resp = conn.getresponse()
+                data = resp.read()
+                resp_headers = {k.lower(): val for k, val in resp.getheaders()}
+                conn.close()
+                return resp.status, resp_headers, data
+
+            # 1. Non-loopback Host headers rejected with 403 (DNS rebinding protection)
+            for bad_host in ("evil.example", f"evil.example:{port}", "192.168.1.50:8788", "0.0.0.0", "127.0.0.1.evil.example"):
+                st_home, _, _ = send_raw("GET", "/", {"Host": bad_host})
+                self.assertEqual(st_home, 403, msg=f"Expected 403 for GET / with Host={bad_host!r}")
+                st_api, _, _ = send_raw("GET", "/api/status", {"Host": bad_host})
+                self.assertEqual(st_api, 403, msg=f"Expected 403 for GET /api/status with Host={bad_host!r}")
+                st_post, _, _ = send_raw(
+                    "POST",
+                    "/api/restore",
+                    {"Host": bad_host, "Content-Type": "application/json"},
+                    json.dumps({"text": "[[EMAIL_1]]"}).encode("utf-8"),
+                )
+                self.assertEqual(st_post, 403, msg=f"Expected 403 for POST /api/restore with Host={bad_host!r}")
+
+            # 2. Non-JSON Content-Type on POST /api/redact and /api/restore rejected with 415 (no vault mutation)
+            for bad_ct in ("text/plain", "text/plain; charset=utf-8", "application/x-www-form-urlencoded", "multipart/form-data"):
+                for endpoint in ("/api/redact", "/api/restore"):
+                    st_ct, _, _ = send_raw(
+                        "POST",
+                        endpoint,
+                        {"Host": f"127.0.0.1:{port}", "Content-Type": bad_ct},
+                        b'{"text": "csrf.leak@example.com"}',
+                    )
+                    self.assertEqual(st_ct, 415, msg=f"Expected 415 for {endpoint} with Content-Type={bad_ct!r}")
+
+            st_no_ct, _, _ = send_raw(
+                "POST",
+                "/api/redact",
+                {"Host": f"127.0.0.1:{port}"},
+                b'{"text": "csrf.leak@example.com"}',
+            )
+            self.assertEqual(st_no_ct, 415)
+            self.assertEqual(len(v.fwd), 1)
+            self.assertEqual(map_path.read_text(encoding="utf-8"), initial_map)
+
+            # 3. Cross-origin Origin and Sec-Fetch-Site: cross-site rejected with 403
+            for bad_origin in ("https://evil.example", f"http://evil.example:{port}", "http://192.168.1.50:8788", "null", f"http://127.0.0.1:{port + 1}"):
+                st_og_get, _, _ = send_raw("GET", "/api/status", {"Host": f"127.0.0.1:{port}", "Origin": bad_origin})
+                self.assertEqual(st_og_get, 403, msg=f"Expected 403 for GET with Origin={bad_origin!r}")
+                st_og_post, _, _ = send_raw(
+                    "POST",
+                    "/api/redact",
+                    {"Host": f"127.0.0.1:{port}", "Origin": bad_origin, "Content-Type": "application/json"},
+                    b'{"text": "csrf.origin@example.com"}',
+                )
+                self.assertEqual(st_og_post, 403, msg=f"Expected 403 for POST with Origin={bad_origin!r}")
+
+            st_sfs_get, _, _ = send_raw("GET", "/api/status", {"Host": f"127.0.0.1:{port}", "Sec-Fetch-Site": "cross-site"})
+            self.assertEqual(st_sfs_get, 403)
+            st_sfs_post, _, _ = send_raw(
+                "POST",
+                "/api/redact",
+                {"Host": f"127.0.0.1:{port}", "Sec-Fetch-Site": "cross-site", "Content-Type": "application/json"},
+                b'{"text": "csrf.sfs@example.com"}',
+            )
+            self.assertEqual(st_sfs_post, 403)
+            self.assertEqual(len(v.fwd), 1)
+            self.assertEqual(map_path.read_text(encoding="utf-8"), initial_map)
+
+            # 4. CORS preflight OPTIONS rejected with 405 and no Access-Control-Allow-Origin
+            st_opt, opt_hdrs, _ = send_raw(
+                "OPTIONS",
+                "/api/redact",
+                {"Host": f"127.0.0.1:{port}", "Origin": f"http://127.0.0.1:{port}"},
+            )
+            self.assertEqual(st_opt, 405)
+            self.assertNotIn("access-control-allow-origin", opt_hdrs)
+
+            # 5. Normal loopback & same-origin requests succeed with 200
+            for ok_host, ok_origin in (
+                (f"127.0.0.1:{port}", f"http://127.0.0.1:{port}"),
+                (f"localhost:{port}", f"http://localhost:{port}"),
+                (f"[::1]:{port}", f"http://[::1]:{port}"),
+            ):
+                st_ok_get, _, _ = send_raw(
+                    "GET",
+                    "/api/status",
+                    {"Host": ok_host, "Origin": ok_origin, "Sec-Fetch-Site": "same-origin"},
+                )
+                self.assertEqual(st_ok_get, 200, msg=f"Expected 200 for Host={ok_host!r}, Origin={ok_origin!r}")
+
+                st_ok_red, _, red_raw = send_raw(
+                    "POST",
+                    "/api/redact",
+                    {
+                        "Host": ok_host,
+                        "Origin": ok_origin,
+                        "Sec-Fetch-Site": "same-origin",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                    json.dumps({"text": "Reach legittest@example.com"}).encode("utf-8"),
+                )
+                self.assertEqual(st_ok_red, 200)
+                self.assertEqual(json.loads(red_raw.decode("utf-8"))["safe_text"], "Reach [[EMAIL_2]]")
+
+                st_ok_res, _, res_raw = send_raw(
+                    "POST",
+                    "/api/restore",
+                    {
+                        "Host": ok_host,
+                        "Origin": ok_origin,
+                        "Sec-Fetch-Site": "same-origin",
+                        "Content-Type": "application/json",
+                    },
+                    json.dumps({"text": "Reply [[EMAIL_2]]"}).encode("utf-8"),
+                )
+                self.assertEqual(st_ok_res, 200)
+                self.assertEqual(json.loads(res_raw.decode("utf-8"))["restored_text"], "Reply legittest@example.com")
+
     def test_cli_ui_help_and_dispatch(self):
         command = [sys.executable, "-m", "prosze_cli"]
         env = os.environ.copy()
