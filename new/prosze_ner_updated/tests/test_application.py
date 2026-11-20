@@ -2149,6 +2149,314 @@ class ApplicationTests(unittest.TestCase):
             self.assertEqual(run_exit.exception.code, 0)
             self.assertEqual(out_run.getvalue(), "ECHO:Contact bob@example.com")
 
+    def test_inspector_loopback_validation_and_endpoints(self):
+        from prosze_cli.broker import create_broker_server
+        from prosze_cli.inspector import create_inspector_server
+
+        with tempfile.TemporaryDirectory() as directory:
+            v = self.make_vault(directory, ephemeral=True, passphrase="inspector-passphrase")
+
+            # Non-loopback hosts rejected
+            for bad_host in ("0.0.0.0", "192.168.1.50", "10.0.0.5", ""):
+                with self.assertRaises(ValueError):
+                    create_inspector_server(v, host=bad_host, port=0)
+
+            # Loopback hosts accepted
+            for ok_host in ("127.0.0.1", "localhost", "::1"):
+                srv = create_inspector_server(v, host=ok_host, port=0)
+                srv.server_close()
+
+            # Populate vault with a sensitive term and email (unique lengths 28 and 24)
+            secret_term = "super-secret-value-987654321"
+            secret_email = "alice.unique@example.com"
+            v.add_term(f"SECRETKEY={secret_term}")
+            v.redact(f"Contact {secret_email} about {secret_term}.")
+
+            gateway = create_broker_server(v, host="127.0.0.1", port=0, upstream="http://127.0.0.1:9999")
+            self.addCleanup(gateway.server_close)
+            gateway.record_history("POST", "/v1/chat/completions", 200, 2, 14.25)
+
+            server = create_inspector_server(v, host="127.0.0.1", port=0, gateway=gateway)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            host, port = server.server_address
+
+            # 1. GET / serves Cloakroom Ticket Inspector HTML with brand system & inline SVGs
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            conn.request("GET", "/")
+            home_resp = conn.getresponse()
+            home_html = home_resp.read().decode("utf-8")
+            home_ct = home_resp.getheader("Content-Type", "")
+            home_cc = home_resp.getheader("Cache-Control", "")
+            conn.close()
+
+            self.assertEqual(home_resp.status, 200)
+            self.assertIn("text/html", home_ct)
+            self.assertIn("no-store", home_cc)
+            for hex_color in ("#12392F", "#E8432A", "#FF6A4D", "#F5EFE2", "#0F1A17", "#8FD0B3", "#56635D", "#D9D1BF"):
+                self.assertIn(hex_color, home_html)
+            for font_name in ("Fraunces", "Schibsted Grotesk", "JetBrains Mono"):
+                self.assertIn(font_name, home_html)
+            self.assertIn('viewBox="0 0 289.45 201.16"', home_html)
+            self.assertGreaterEqual(home_html.count('viewBox="0 0 96.00 96.00"'), 4)
+            self.assertIn("250ms", home_html)
+            self.assertIn("ease-out", home_html)
+            self.assertNotIn(secret_term, home_html)
+            self.assertNotIn(secret_email, home_html)
+
+            # 2. GET /api/status returns metadata + <hidden> previews without leaking secrets or lengths
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            conn.request("GET", "/api/status")
+            st_resp = conn.getresponse()
+            st_raw = st_resp.read().decode("utf-8")
+            conn.close()
+            self.assertEqual(st_resp.status, 200)
+            st_data = json.loads(st_raw)
+            self.assertEqual(st_data["status"], "ok")
+            self.assertEqual(st_data["ticket_count"], 2)
+            self.assertEqual(st_data["categories"], {"EMAIL": 1, "SECRETKEY": 1})
+            self.assertTrue(st_data["ephemeral"])
+            self.assertTrue(st_data["encrypted"])
+            self.assertFalse(st_data["strict_restore"])
+            self.assertEqual(
+                st_data["tickets"],
+                [
+                    {"placeholder": "[[EMAIL_1]]", "preview": "<hidden>"},
+                    {"placeholder": "[[SECRETKEY_1]]", "preview": "<hidden>"},
+                ],
+            )
+            self.assertNotIn(secret_term, st_raw)
+            self.assertNotIn(secret_email, st_raw)
+            self.assertNotIn(str(len(secret_term)), st_raw)
+            self.assertNotIn(str(len(secret_email)), st_raw)
+            self.assertTrue(st_data["broker"]["attached"])
+            self.assertEqual(st_data["broker"]["request_count"], 1)
+            self.assertEqual(st_data["broker"]["total_redacted"], 2)
+            self.assertEqual(st_data["broker"]["history"][0]["path"], "/v1/chat/completions")
+
+            # 3. POST /api/redact
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            conn.request(
+                "POST",
+                "/api/redact",
+                body=json.dumps({"text": "Mail bob@example.com with sk-proj-abcdef1234567890"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            rd_resp = conn.getresponse()
+            rd_data = json.loads(rd_resp.read().decode("utf-8"))
+            conn.close()
+            self.assertEqual(rd_resp.status, 200)
+            self.assertEqual(rd_data["safe_text"], "Mail [[EMAIL_2]] with [[TOKEN_1]]")
+            self.assertEqual(rd_data["hits"], 2)
+            self.assertEqual(rd_data["ticket_count"], 4)
+
+            # 4. POST /api/restore
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            conn.request(
+                "POST",
+                "/api/restore",
+                body=json.dumps({"text": "Reply to [[EMAIL_2]] using [[TOKEN_1]]"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            rs_resp = conn.getresponse()
+            rs_data = json.loads(rs_resp.read().decode("utf-8"))
+            conn.close()
+            self.assertEqual(rs_resp.status, 200)
+            self.assertEqual(rs_data["restored_text"], "Reply to bob@example.com using sk-proj-abcdef1234567890")
+
+            # 5. Request validation & error status codes (400 / 413 / 404 / 405)
+            for bad_body in (b"not-json", b"[]", b"{}", b'{"text": 123}'):
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("POST", "/api/redact", body=bad_body, headers={"Content-Type": "application/json"})
+                b_resp = conn.getresponse()
+                b_resp.read()
+                conn.close()
+                self.assertEqual(b_resp.status, 400)
+
+            over_cap = (16 * 1024 * 1024) + 1
+            with socket.create_connection((host, port), timeout=5) as sock:
+                sock.sendall(
+                    f"POST /api/redact HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {over_cap}\r\nConnection: close\r\n\r\n".encode("ascii")
+                )
+                raw_413 = sock.recv(4096).decode("utf-8", "replace")
+            self.assertTrue(raw_413.startswith("HTTP/1.1 413 ") or raw_413.startswith("HTTP/1.0 413 "))
+
+            with socket.create_connection((host, port), timeout=5) as sock:
+                sock.sendall(
+                    b"POST /api/redact HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n"
+                )
+                raw_400 = sock.recv(4096).decode("utf-8", "replace")
+            self.assertTrue(raw_400.startswith("HTTP/1.1 400 ") or raw_400.startswith("HTTP/1.0 400 "))
+
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            conn.request("GET", "/unknown")
+            r404 = conn.getresponse()
+            r404.read()
+            conn.close()
+            self.assertEqual(r404.status, 404)
+
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            conn.request("DELETE", "/api/status")
+            r405 = conn.getresponse()
+            r405.read()
+            conn.close()
+            self.assertEqual(r405.status, 405)
+
+            # 6. Concurrent access remains thread-safe
+            def worker(idx):
+                c = http.client.HTTPConnection(host, port, timeout=5)
+                c.request(
+                    "POST",
+                    "/api/redact",
+                    body=json.dumps({"text": f"Worker {idx} user{idx}@example.com"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                wr = c.getresponse()
+                wdata = json.loads(wr.read().decode("utf-8"))
+                c.close()
+                self.assertEqual(wr.status, 200)
+                self.assertEqual(wdata["hits"], 1)
+
+                c2 = http.client.HTTPConnection(host, port, timeout=5)
+                c2.request(
+                    "POST",
+                    "/api/restore",
+                    body=json.dumps({"text": wdata["safe_text"]}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                wr2 = c2.getresponse()
+                wdata2 = json.loads(wr2.read().decode("utf-8"))
+                c2.close()
+                self.assertEqual(wr2.status, 200)
+                self.assertEqual(wdata2["restored_text"], f"Worker {idx} user{idx}@example.com")
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=5)
+                self.assertFalse(th.is_alive())
+
+            # 7. Standalone inspector (gateway=None) + strict_restore enforcement on /api/restore
+            strict_map = Path(directory) / "strict_ui_map.tsv"
+            strict_map.write_text("[[TOKEN_9]]\tpreloaded-ui-secret\n", encoding="utf-8")
+            strict_vault = Vault(str(strict_map), strict_restore=True)
+            strict_vault._ner_attempted = True
+            standalone_srv = create_inspector_server(strict_vault, host="127.0.0.1", port=0, gateway=None)
+            standalone_thread = threading.Thread(target=standalone_srv.serve_forever, daemon=True)
+            standalone_thread.start()
+            self.addCleanup(standalone_srv.server_close)
+            self.addCleanup(standalone_srv.shutdown)
+            s_host, s_port = standalone_srv.server_address
+
+            conn = http.client.HTTPConnection(s_host, s_port, timeout=5)
+            conn.request("GET", "/api/status")
+            solo_st = json.loads(conn.getresponse().read().decode("utf-8"))
+            conn.close()
+            self.assertFalse(solo_st["broker"]["attached"])
+            self.assertEqual(solo_st["broker"]["request_count"], 0)
+            self.assertTrue(solo_st["strict_restore"])
+
+            conn = http.client.HTTPConnection(s_host, s_port, timeout=5)
+            conn.request(
+                "POST",
+                "/api/restore",
+                body=json.dumps({"text": "Blocked [[TOKEN_9]]"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            solo_rs = json.loads(conn.getresponse().read().decode("utf-8"))
+            conn.close()
+            self.assertEqual(solo_rs["restored_text"], "Blocked [[TOKEN_9]]")
+
+    def test_cli_ui_help_and_dispatch(self):
+        command = [sys.executable, "-m", "prosze_cli"]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PACKAGE_DIR)
+
+        help_res = subprocess.run(
+            command + ["ui", "--help"],
+            cwd=PACKAGE_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(help_res.returncode, 0, msg=help_res.stderr)
+        self.assertIn("--listen", help_res.stdout)
+        self.assertIn("--no-browser", help_res.stdout)
+        self.assertIn("127.0.0.1:8788", help_res.stdout)
+
+        # --no-browser prevents webbrowser.open
+        err_no_browser = io.StringIO()
+        with patch("sys.stderr", new=err_no_browser), \
+             patch("webbrowser.open") as mock_open, \
+             patch("prosze_cli.inspector.InspectorServer.serve_forever") as mock_serve:
+            cli_main([
+                "ui",
+                "--listen", "127.0.0.1:0",
+                "--no-browser",
+                "--no-ner",
+                "--ephemeral",
+            ])
+        mock_serve.assert_called_once()
+        mock_open.assert_not_called()
+        self.assertIn("prosze ui listening on http://127.0.0.1:", err_no_browser.getvalue())
+
+        # Default (without --no-browser) calls webbrowser.open with bound URL
+        err_open = io.StringIO()
+        with patch("sys.stderr", new=err_open), \
+             patch("webbrowser.open") as mock_open, \
+             patch("prosze_cli.inspector.InspectorServer.serve_forever") as mock_serve2:
+            cli_main([
+                "ui",
+                "--listen", "127.0.0.1:0",
+                "--no-ner",
+                "--ephemeral",
+            ])
+        mock_serve2.assert_called_once()
+        mock_open.assert_called_once()
+        self.assertTrue(mock_open.call_args.args[0].startswith("http://127.0.0.1:"))
+
+        # Non-loopback host rejected cleanly
+        bad_err = io.StringIO()
+        with patch("sys.stderr", new=bad_err), self.assertRaises(SystemExit) as cm:
+            cli_main([
+                "ui",
+                "--listen", "0.0.0.0:8788",
+                "--no-browser",
+                "--no-ner",
+                "--ephemeral",
+            ])
+        self.assertNotEqual(cm.exception.code, 0)
+        self.assertIn("refusing non-loopback listen host", bad_err.getvalue())
+
+    def test_cross_language_conformance_suite(self):
+        fixture_path = PACKAGE_DIR.parents[1] / "prosze" / "tests" / "fixtures" / "conformance.json"
+        self.assertTrue(fixture_path.is_file(), f"Missing fixture: {fixture_path}")
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            fixture = json.load(f)
+
+        cases = fixture.get("cases", [])
+        self.assertGreaterEqual(len(cases), 20)
+
+        with tempfile.TemporaryDirectory() as directory:
+            for idx, case in enumerate(cases):
+                case_id = case["id"]
+                vault = Vault(str(Path(directory) / f"case_{idx}.tsv"), ephemeral=True)
+                vault._ner_attempted = True
+
+                for term in case.get("terms", []):
+                    vault.add_term(term)
+                for literal in case.get("literals", []):
+                    vault.add_literal(literal)
+
+                redacted, _ = vault.redact(case["input"])
+                self.assertEqual(redacted, case["expected_redacted"], msg=f"redact mismatch for {case_id}")
+                restored = vault.restore(redacted)
+                self.assertEqual(restored, case["expected_restored"], msg=f"restore mismatch for {case_id}")
+
 
 if __name__ == "__main__":
     unittest.main()

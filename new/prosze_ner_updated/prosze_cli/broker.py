@@ -441,6 +441,114 @@ def _connection_tokens(headers) -> set[str]:
     return tokens
 
 
+def has_compressed_encoding(headers: Any) -> bool:
+    """Return True if any Content-Encoding header specifies a non-identity coding."""
+    ce_vals = headers.get_all("Content-Encoding") or []
+    encodings = [
+        tok.strip().lower()
+        for val in ce_vals
+        for tok in val.split(",")
+        if tok.strip()
+    ]
+    return any(enc != "identity" for enc in encodings)
+
+
+def _read_chunked_http_body(rfile: Any, max_bytes: int = MAX_REQUEST_BYTES) -> tuple[Optional[bytes], int, str]:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        line = rfile.readline(8192)
+        if not line or not line.endswith(b"\n"):
+            return None, 400, "Malformed chunked request"
+        size_token = line.strip().split(b";", 1)[0]
+        try:
+            chunk_size = int(size_token, 16)
+        except ValueError:
+            return None, 400, "Invalid chunk size"
+        if chunk_size < 0:
+            return None, 400, "Negative chunk size"
+        if chunk_size == 0:
+            while True:
+                trailer = rfile.readline(8192)
+                if not trailer or trailer in (b"\r\n", b"\n"):
+                    break
+            return b"".join(chunks), 0, ""
+
+        if total + chunk_size > max_bytes:
+            return None, 413, "Request body exceeds 16 MiB limit"
+
+        remaining = chunk_size
+        while remaining > 0:
+            piece = rfile.read(min(remaining, 65536))
+            if not piece:
+                return None, 400, "Truncated chunked body"
+            chunks.append(piece)
+            remaining -= len(piece)
+        total += chunk_size
+
+        crlf = rfile.read(2)
+        if crlf != b"\r\n":
+            return None, 400, "Malformed chunk terminator"
+
+
+def read_http_request_body(
+    headers: Any,
+    rfile: Any,
+    max_bytes: int = MAX_REQUEST_BYTES,
+) -> tuple[Optional[bytes], int, str]:
+    """Read HTTP request body safely enforcing framing rules and size cap.
+
+    Returns (body_bytes, error_status, error_message). On success error_status == 0.
+    """
+    cl_vals = headers.get_all("Content-Length") or []
+    te_vals = headers.get_all("Transfer-Encoding") or []
+
+    if cl_vals and te_vals:
+        return None, 400, "Conflicting Content-Length and Transfer-Encoding headers"
+
+    if cl_vals:
+        parsed_lengths: set[int] = set()
+        for raw_cl in cl_vals:
+            try:
+                val = int(raw_cl.strip())
+            except ValueError:
+                return None, 400, "Invalid Content-Length header"
+            if val < 0:
+                return None, 400, "Negative Content-Length header"
+            parsed_lengths.add(val)
+        if len(parsed_lengths) != 1:
+            return None, 400, "Conflicting Content-Length headers"
+
+        length = next(iter(parsed_lengths))
+        if length > max_bytes:
+            return None, 413, "Request body exceeds 16 MiB limit"
+        if length == 0:
+            return b"", 0, ""
+
+        chunks: list[bytes] = []
+        remaining = length
+        while remaining > 0:
+            piece = rfile.read(min(remaining, 65536))
+            if not piece:
+                return None, 400, "Truncated request body"
+            chunks.append(piece)
+            remaining -= len(piece)
+        return b"".join(chunks), 0, ""
+
+    if te_vals:
+        codings = [
+            tok.strip().lower()
+            for raw_te in te_vals
+            for tok in raw_te.split(",")
+            if tok.strip()
+        ]
+        if codings != ["chunked"]:
+            return None, 400, "Unsupported Transfer-Encoding"
+        return _read_chunked_http_body(rfile, max_bytes=max_bytes)
+
+    return b"", 0, ""
+
+
 class BrokerRequestHandler(BaseHTTPRequestHandler):
     """HTTP/SSE reverse-proxy handler that redacts requests and restores responses."""
 
@@ -463,94 +571,7 @@ class BrokerRequestHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _read_request_body(self) -> tuple[Optional[bytes], int, str]:
-        """Read request body safely enforcing framing rules and 16 MiB size cap.
-
-        Returns (body_bytes, error_status, error_message). On success error_status == 0.
-        """
-        cl_vals = self.headers.get_all("Content-Length") or []
-        te_vals = self.headers.get_all("Transfer-Encoding") or []
-
-        if cl_vals and te_vals:
-            return None, 400, "Conflicting Content-Length and Transfer-Encoding headers"
-
-        if cl_vals:
-            parsed_lengths: set[int] = set()
-            for raw_cl in cl_vals:
-                try:
-                    val = int(raw_cl.strip())
-                except ValueError:
-                    return None, 400, "Invalid Content-Length header"
-                if val < 0:
-                    return None, 400, "Negative Content-Length header"
-                parsed_lengths.add(val)
-            if len(parsed_lengths) != 1:
-                return None, 400, "Conflicting Content-Length headers"
-
-            length = next(iter(parsed_lengths))
-            if length > MAX_REQUEST_BYTES:
-                return None, 413, "Request body exceeds 16 MiB limit"
-            if length == 0:
-                return b"", 0, ""
-
-            chunks: list[bytes] = []
-            remaining = length
-            while remaining > 0:
-                piece = self.rfile.read(min(remaining, 65536))
-                if not piece:
-                    return None, 400, "Truncated request body"
-                chunks.append(piece)
-                remaining -= len(piece)
-            return b"".join(chunks), 0, ""
-
-        if te_vals:
-            codings = [
-                tok.strip().lower()
-                for raw_te in te_vals
-                for tok in raw_te.split(",")
-                if tok.strip()
-            ]
-            if codings != ["chunked"]:
-                return None, 400, "Unsupported Transfer-Encoding"
-            return self._read_chunked_body()
-
-        return b"", 0, ""
-
-    def _read_chunked_body(self) -> tuple[Optional[bytes], int, str]:
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            line = self.rfile.readline(8192)
-            if not line or not line.endswith(b"\n"):
-                return None, 400, "Malformed chunked request"
-            size_token = line.strip().split(b";", 1)[0]
-            try:
-                chunk_size = int(size_token, 16)
-            except ValueError:
-                return None, 400, "Invalid chunk size"
-            if chunk_size < 0:
-                return None, 400, "Negative chunk size"
-            if chunk_size == 0:
-                while True:
-                    trailer = self.rfile.readline(8192)
-                    if not trailer or trailer in (b"\r\n", b"\n"):
-                        break
-                return b"".join(chunks), 0, ""
-
-            if total + chunk_size > MAX_REQUEST_BYTES:
-                return None, 413, "Request body exceeds 16 MiB limit"
-
-            remaining = chunk_size
-            while remaining > 0:
-                piece = self.rfile.read(min(remaining, 65536))
-                if not piece:
-                    return None, 400, "Truncated chunked body"
-                chunks.append(piece)
-                remaining -= len(piece)
-            total += chunk_size
-
-            crlf = self.rfile.read(2)
-            if crlf != b"\r\n":
-                return None, 400, "Malformed chunk terminator"
+        return read_http_request_body(self.headers, self.rfile, max_bytes=MAX_REQUEST_BYTES)
 
     def _redact_request_body(self, raw_body: bytes, content_type: str) -> tuple[bytes, int]:
         if not raw_body:
@@ -628,14 +649,7 @@ class BrokerRequestHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _has_compressed_encoding(headers: Any) -> bool:
-        ce_vals = headers.get_all("Content-Encoding") or []
-        encodings = [
-            tok.strip().lower()
-            for val in ce_vals
-            for tok in val.split(",")
-            if tok.strip()
-        ]
-        return any(enc != "identity" for enc in encodings)
+        return has_compressed_encoding(headers)
 
     def _stream_sse_response(self, up_resp: http.client.HTTPResponse) -> None:
         self.send_response(up_resp.status, up_resp.reason)

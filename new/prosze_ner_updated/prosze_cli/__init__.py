@@ -273,6 +273,36 @@ def cmd_broker_wrap(v: Vault, cmd: list[str]) -> None:
     _run_broker_command("wrap", cmd, lambda c: run_interactive_wrap(v, c))
 
 
+def cmd_ui(
+    v: Vault,
+    listen: str = "127.0.0.1:8788",
+    no_browser: bool = False,
+) -> None:
+    from prosze_cli.broker import parse_listen_addr
+    from prosze_cli.inspector import DEFAULT_PORT, create_inspector_server
+
+    host, port = parse_listen_addr(listen, default_port=DEFAULT_PORT)
+    server = create_inspector_server(v, host=host, port=port)
+    bound_host, bound_port = server.server_address[0], server.server_address[1]
+    display_host = f"[{bound_host}]" if ":" in bound_host else bound_host
+    url = f"http://{display_host}:{bound_port}/"
+    sys.stderr.write(f"prosze ui listening on {url}\n")
+    sys.stderr.flush()
+    if not no_browser:
+        import webbrowser
+
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 # ---- CLI ----------------------------------------------------------------
 def cli_main(argv: Optional[list[str]] = None) -> None:
     if argv is None:
@@ -294,6 +324,22 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
     sub = ap.add_subparsers(dest="cmd")
     for name in ("chat", "tui", "redact", "restore", "check", "run"):
         sub.add_parser(name, parents=[common])
+
+    ui_parser = sub.add_parser(
+        "ui",
+        parents=[common],
+        help="launch local Cloakroom Ticket web inspector",
+    )
+    ui_parser.add_argument(
+        "--listen",
+        default="127.0.0.1:8788",
+        help="listen address host:port (default: 127.0.0.1:8788)",
+    )
+    ui_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="do not automatically open a web browser",
+    )
 
     broker_parser = sub.add_parser("broker", help="privacy broker gateways and wrappers")
     broker_sub = broker_parser.add_subparsers(dest="broker_cmd")
@@ -359,6 +405,12 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         cmd_check(v)
     elif a.cmd == "run":
         cmd_run(v, cmd, confirm=getattr(a, "confirm", False))
+    elif a.cmd == "ui":
+        try:
+            cmd_ui(v, listen=a.listen, no_browser=a.no_browser)
+        except ValueError as exc:
+            sys.stderr.write(f"{exc}\n")
+            sys.exit(1)
     elif a.cmd == "broker" and a.broker_cmd == "serve":
         try:
             cmd_broker_serve(

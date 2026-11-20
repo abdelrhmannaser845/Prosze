@@ -1,0 +1,212 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "email",
+      "category": "EMAIL",
+      "terms": [],
+      "literals": [],
+      "input": "Send invoice to alice.smith@example.com and bob+ops@sub.example.org.",
+      "expected_redacted": "Send invoice to [[EMAIL_1]] and [[EMAIL_2]].",
+      "expected_restored": "Send invoice to alice.smith@example.com and bob+ops@sub.example.org."
+    },
+    {
+      "id": "token_aws_akia",
+      "category": "TOKEN",
+      "terms": [],
+      "literals": [],
+      "input": "AWS key AKIAIOSFODNN7EXAMPLE and temp ASIA1234567890ABCDEF.",
+      "expected_redacted": "AWS key [[TOKEN_1]] and temp [[TOKEN_2]].",
+      "expected_restored": "AWS key AKIAIOSFODNN7EXAMPLE and temp ASIA1234567890ABCDEF."
+    },
+    {
+      "id": "token_google_aiza",
+      "category": "TOKEN",
+      "terms": [],
+      "literals": [],
+      "input": "Maps key AIzaSyD-0123456789abcdefghijklmnopqrstu loaded.",
+      "expected_redacted": "Maps key [[TOKEN_1]] loaded.",
+      "expected_restored": "Maps key AIzaSyD-0123456789abcdefghijklmnopqrstu loaded."
+    },
+    {
+      "id": "token_huggingface",
+      "category": "TOKEN",
+      "terms": [],
+      "literals": [],
+      "input": "HF token hf_0123456789abcdef0123456789abcdef configured.",
+      "expected_redacted": "HF token [[TOKEN_1]] configured.",
+      "expected_restored": "HF token hf_0123456789abcdef0123456789abcdef configured."
+    },
+    {
+      "id": "token_github_pat",
+      "category": "TOKEN",
+      "terms": [],
+      "literals": [],
+      "input": "PAT github_pat_11ABCD0123456789012345 granted.",
+      "expected_redacted": "PAT [[TOKEN_1]] granted.",
+      "expected_restored": "PAT github_pat_11ABCD0123456789012345 granted."
+    },
+    {
+      "id": "token_slack_webhook",
+      "category": "TOKEN",
+      "terms": [],
+      "literals": [],
+      "input": "Alert https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX on failure.",
+      "expected_redacted": "Alert [[TOKEN_1]] on failure.",
+      "expected_restored": "Alert https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX on failure."
+    },
+    {
+      "id": "token_openai_sk_proj",
+      "category": "TOKEN",
+      "terms": [],
+      "literals": [],
+      "input": "OpenAI sk-proj-abcdef1234567890 active.",
+      "expected_redacted": "OpenAI [[TOKEN_1]] active.",
+      "expected_restored": "OpenAI sk-proj-abcdef1234567890 active."
+    },
+    {
+      "id": "token_anthropic_sk_ant",
+      "category": "TOKEN",
+      "terms": [],
+      "literals": [],
+      "input": "Anthropic sk-ant-api03-abcdef1234567890 active.",
+      "expected_redacted": "Anthropic [[TOKEN_1]] active.",
+      "expected_restored": "Anthropic sk-ant-api03-abcdef1234567890 active."
+    },
+    {
+      "id": "token_jwt",
+      "category": "TOKEN",
+      "terms": [],
+      "literals": [],
+      "input": "JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signature12345 accepted.",
+      "expected_redacted": "JWT [[TOKEN_1]] accepted.",
+      "expected_restored": "JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signature12345 accepted."
+    },
+    {
+      "id": "token_bearer",
+      "category": "TOKEN",
+      "terms": [],
+      "literals": [],
+      "input": "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWx",
+      "expected_redacted": "Authorization: Bearer [[TOKEN_1]]",
+      "expected_restored": "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWx"
+    },
+    {
+      "id": "password_url",
+      "category": "PASSWORD",
+      "terms": [],
+      "literals": [],
+      "input": "Connect to postgres://appuser:s3cr3tPass!@db.internal:5432/prod",
+      "expected_redacted": "Connect to postgres://appuser:[[PASSWORD_1]]@db.internal:5432/prod",
+      "expected_restored": "Connect to postgres://appuser:s3cr3tPass!@db.internal:5432/prod"
+    },
+    {
+      "id": "password_kv",
+      "category": "PASSWORD",
+      "terms": [],
+      "literals": [],
+      "input": "Set db_password=superSecret99 and api_secret=\"myTopSecret1\" before boot.",
+      "expected_redacted": "Set db_password=[[PASSWORD_1]] and api_secret=\"[[PASSWORD_2]]\" before boot.",
+      "expected_restored": "Set db_password=superSecret99 and api_secret=\"myTopSecret1\" before boot."
+    },
+    {
+      "id": "iban",
+      "category": "IBAN",
+      "terms": [],
+      "literals": [],
+      "input": "Wire transfer to DE89370400440532013000 today.",
+      "expected_redacted": "Wire transfer to [[IBAN_1]] today.",
+      "expected_restored": "Wire transfer to DE89370400440532013000 today."
+    },
+    {
+      "id": "ssn",
+      "category": "SSN",
+      "terms": [],
+      "literals": [],
+      "input": "Taxpayer SSN 123-45-6789 verified; ignore short 123-45-678.",
+      "expected_redacted": "Taxpayer SSN [[SSN_1]] verified; ignore short 123-45-678.",
+      "expected_restored": "Taxpayer SSN 123-45-6789 verified; ignore short 123-45-678."
+    },
+    {
+      "id": "card",
+      "category": "CARD",
+      "terms": [],
+      "literals": [],
+      "input": "Charge card 4111111111111111 or 4111-1111-1111-1111; skip 4111111111111112.",
+      "expected_redacted": "Charge card [[CARD_1]] or [[CARD_2]]; skip 4111111111111112.",
+      "expected_restored": "Charge card 4111111111111111 or 4111-1111-1111-1111; skip 4111111111111112."
+    },
+    {
+      "id": "apikey",
+      "category": "APIKEY",
+      "terms": [],
+      "literals": [],
+      "input": "Key A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6 and digest abcdefabcdefabcdefabcdefabcdefabcdefabcd.",
+      "expected_redacted": "Key [[APIKEY_1]] and digest [[APIKEY_2]].",
+      "expected_restored": "Key A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6 and digest abcdefabcdefabcdefabcdefabcdefabcdefabcd."
+    },
+    {
+      "id": "ip_ipv4_private_and_metadata",
+      "category": "IP",
+      "terms": [],
+      "literals": [],
+      "input": "Nodes 10.0.1.5, 172.16.4.8, 192.168.10.20, metadata 169.254.169.254; public 8.8.8.8.",
+      "expected_redacted": "Nodes [[IP_1]], [[IP_2]], [[IP_3]], metadata [[IP_4]]; public 8.8.8.8.",
+      "expected_restored": "Nodes 10.0.1.5, 172.16.4.8, 192.168.10.20, metadata 169.254.169.254; public 8.8.8.8."
+    },
+    {
+      "id": "ip_ipv6_ula_and_link_local",
+      "category": "IP",
+      "terms": [],
+      "literals": [],
+      "input": "ULA fd00:: and fd12:3456:789a:1::1; link-local fe80:: and fe80::1; public 2001:db8::1.",
+      "expected_redacted": "ULA [[IP_1]] and [[IP_2]]; link-local [[IP_3]] and [[IP_4]]; public 2001:db8::1.",
+      "expected_restored": "ULA fd00:: and fd12:3456:789a:1::1; link-local fe80:: and fe80::1; public 2001:db8::1."
+    },
+    {
+      "id": "phone",
+      "category": "PHONE",
+      "terms": [],
+      "literals": [],
+      "input": "Call +48 601 234 567, phone: 555 123 4567, or 601 234 567; date 2026-11-20 stays.",
+      "expected_redacted": "Call [[PHONE_2]], phone: [[PHONE_1]], or [[PHONE_3]]; date 2026-11-20 stays.",
+      "expected_restored": "Call +48 601 234 567, phone: 555 123 4567, or 601 234 567; date 2026-11-20 stays."
+    },
+    {
+      "id": "encoded_base64_secret",
+      "category": "ENCODED",
+      "terms": [],
+      "literals": [],
+      "input": "Header QmVhcmVyIHNrLWV4YW1wbGUxMjM0NTY3ODkwYWJjZGVm, body cGFzc3dvcmQ9c3VwZXJzZWNyZXQxMjM=, plain TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQsIGNvbnNlY3RldHVyIGFkaXBpc2NpbmcgZWxpdC4=.",
+      "expected_redacted": "Header [[ENCODED_1]], body [[ENCODED_2]], plain TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQsIGNvbnNlY3RldHVyIGFkaXBpc2NpbmcgZWxpdC4=.",
+      "expected_restored": "Header QmVhcmVyIHNrLWV4YW1wbGUxMjM0NTY3ODkwYWJjZGVm, body cGFzc3dvcmQ9c3VwZXJzZWNyZXQxMjM=, plain TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQsIGNvbnNlY3RldHVyIGFkaXBpc2NpbmcgZWxpdC4=."
+    },
+    {
+      "id": "env_literal",
+      "category": "ENV",
+      "terms": [],
+      "literals": ["literal-env-secret-9988"],
+      "input": "Injected literal-env-secret-9988 and again literal-env-secret-9988.",
+      "expected_redacted": "Injected [[ENV_1]] and again [[ENV_1]].",
+      "expected_restored": "Injected literal-env-secret-9988 and again literal-env-secret-9988."
+    },
+    {
+      "id": "customer_terms_case_insensitive",
+      "category": "CUSTOMER",
+      "terms": ["CUSTOMER=Acme Corp"],
+      "literals": [],
+      "input": "Bill Acme Corp, ACME CORP, and acme corp; keep acme_corp and Acme Corporation.",
+      "expected_redacted": "Bill [[CUSTOMER_1]], [[CUSTOMER_1]], and [[CUSTOMER_1]]; keep acme_corp and Acme Corporation.",
+      "expected_restored": "Bill Acme Corp, Acme Corp, and Acme Corp; keep acme_corp and Acme Corporation."
+    },
+    {
+      "id": "combined_multi_category",
+      "category": "MIXED",
+      "terms": ["CUSTOMER=Acme Corp"],
+      "literals": ["env-secret-token-42"],
+      "input": "Customer Acme Corp (acme corp) at 10.1.2.3 uses env-secret-token-42, mail ops@acme.example, key sk-proj-abcdef1234567890, payload cGFzc3dvcmQ9c3VwZXJzZWNyZXQxMjM=.",
+      "expected_redacted": "Customer [[CUSTOMER_1]] ([[CUSTOMER_1]]) at [[IP_1]] uses [[ENV_1]], mail [[EMAIL_1]], key [[TOKEN_1]], payload [[ENCODED_1]].",
+      "expected_restored": "Customer Acme Corp (Acme Corp) at 10.1.2.3 uses env-secret-token-42, mail ops@acme.example, key sk-proj-abcdef1234567890, payload cGFzc3dvcmQ9c3VwZXJzZWNyZXQxMjM=."
+    }
+  ]
+}

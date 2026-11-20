@@ -709,6 +709,310 @@ static void test_confirm_redaction_approval_and_rejection()
     }
 }
 
+namespace {
+struct JsonValue
+{
+    enum Type { Null, Bool, Number, String, Array, Object };
+    Type type = Null;
+    bool bool_val = false;
+    double num_val = 0.0;
+    string str_val;
+    vector<JsonValue> arr_val;
+    map<string, JsonValue> obj_val;
+
+    const JsonValue& at(const string& k) const
+    {
+        assert(type == Object);
+        auto it = obj_val.find(k);
+        assert(it != obj_val.end());
+        return it->second;
+    }
+
+    const string& as_string() const
+    {
+        assert(type == String);
+        return str_val;
+    }
+
+    const vector<JsonValue>& as_array() const
+    {
+        assert(type == Array);
+        return arr_val;
+    }
+};
+
+class MiniJsonParser
+{
+    const string& src;
+    size_t pos = 0;
+
+    void skip_ws()
+    {
+        while (pos < src.size() && (src[pos] == ' ' || src[pos] == '\t' || src[pos] == '\r' || src[pos] == '\n'))
+            ++pos;
+    }
+
+    char peek()
+    {
+        skip_ws();
+        assert(pos < src.size());
+        return src[pos];
+    }
+
+    char get_char()
+    {
+        assert(pos < src.size());
+        return src[pos++];
+    }
+
+    void expect(char c)
+    {
+        skip_ws();
+        assert(pos < src.size() && src[pos] == c);
+        ++pos;
+    }
+
+    static void append_utf8(string& out, uint32_t cp)
+    {
+        if (cp <= 0x7F)
+        {
+            out.push_back((char)cp);
+        }
+        else if (cp <= 0x7FF)
+        {
+            out.push_back((char)(0xC0 | ((cp >> 6) & 0x1F)));
+            out.push_back((char)(0x80 | (cp & 0x3F)));
+        }
+        else if (cp <= 0xFFFF)
+        {
+            out.push_back((char)(0xE0 | ((cp >> 12) & 0x0F)));
+            out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back((char)(0x80 | (cp & 0x3F)));
+        }
+        else
+        {
+            out.push_back((char)(0xF0 | ((cp >> 18) & 0x07)));
+            out.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back((char)(0x80 | (cp & 0x3F)));
+        }
+    }
+
+    uint32_t parse_hex4()
+    {
+        uint32_t val = 0;
+        for (int i = 0; i < 4; ++i)
+        {
+            char c = get_char();
+            val <<= 4;
+            if (c >= '0' && c <= '9') val |= (uint32_t)(c - '0');
+            else if (c >= 'a' && c <= 'f') val |= (uint32_t)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') val |= (uint32_t)(c - 'A' + 10);
+            else assert(false && "invalid hex escape in JSON");
+        }
+        return val;
+    }
+
+    string parse_string()
+    {
+        expect('"');
+        string out;
+        while (pos < src.size())
+        {
+            char c = get_char();
+            if (c == '"') return out;
+            if (c == '\\')
+            {
+                char esc_c = get_char();
+                switch (esc_c)
+                {
+                case '"': out.push_back('"'); break;
+                case '\\': out.push_back('\\'); break;
+                case '/': out.push_back('/'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case 'n': out.push_back('\n'); break;
+                case 'r': out.push_back('\r'); break;
+                case 't': out.push_back('\t'); break;
+                case 'u':
+                {
+                    uint32_t cp = parse_hex4();
+                    if (cp >= 0xD800 && cp <= 0xDBFF && pos + 2 <= src.size() && src[pos] == '\\' && src[pos + 1] == 'u')
+                    {
+                        pos += 2;
+                        uint32_t low = parse_hex4();
+                        assert(low >= 0xDC00 && low <= 0xDFFF);
+                        cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                    }
+                    append_utf8(out, cp);
+                    break;
+                }
+                default:
+                    assert(false && "unsupported escape in JSON");
+                }
+            }
+            else
+            {
+                out.push_back(c);
+            }
+        }
+        assert(false && "unterminated JSON string");
+        return out;
+    }
+
+    JsonValue parse_number()
+    {
+        skip_ws();
+        size_t start = pos;
+        if (pos < src.size() && src[pos] == '-') ++pos;
+        while (pos < src.size() && (isdigit((unsigned char)src[pos]) || src[pos] == '.' || src[pos] == 'e' || src[pos] == 'E' || src[pos] == '+' || src[pos] == '-'))
+            ++pos;
+        assert(pos > start);
+        JsonValue v;
+        v.type = JsonValue::Number;
+        v.num_val = stod(src.substr(start, pos - start));
+        return v;
+    }
+
+public:
+    explicit MiniJsonParser(const string& s) : src(s) {}
+
+    JsonValue parse()
+    {
+        JsonValue v = parse_value();
+        skip_ws();
+        assert(pos == src.size());
+        return v;
+    }
+
+    JsonValue parse_value()
+    {
+        char c = peek();
+        if (c == '"')
+        {
+            JsonValue v;
+            v.type = JsonValue::String;
+            v.str_val = parse_string();
+            return v;
+        }
+        if (c == '{')
+        {
+            expect('{');
+            JsonValue v;
+            v.type = JsonValue::Object;
+            if (peek() == '}') { expect('}'); return v; }
+            while (true)
+            {
+                string key = parse_string();
+                expect(':');
+                v.obj_val.emplace(move(key), parse_value());
+                if (peek() == ',') { expect(','); continue; }
+                expect('}');
+                break;
+            }
+            return v;
+        }
+        if (c == '[')
+        {
+            expect('[');
+            JsonValue v;
+            v.type = JsonValue::Array;
+            if (peek() == ']') { expect(']'); return v; }
+            while (true)
+            {
+                v.arr_val.push_back(parse_value());
+                if (peek() == ',') { expect(','); continue; }
+                expect(']');
+                break;
+            }
+            return v;
+        }
+        if (src.compare(pos, 4, "true") == 0)
+        {
+            pos += 4;
+            JsonValue v;
+            v.type = JsonValue::Bool;
+            v.bool_val = true;
+            return v;
+        }
+        if (src.compare(pos, 5, "false") == 0)
+        {
+            pos += 5;
+            JsonValue v;
+            v.type = JsonValue::Bool;
+            v.bool_val = false;
+            return v;
+        }
+        if (src.compare(pos, 4, "null") == 0)
+        {
+            pos += 4;
+            return JsonValue{};
+        }
+        return parse_number();
+    }
+};
+}
+
+static void test_cross_language_conformance_suite()
+{
+    fs::path fixture_path = fs::path("prosze") / "tests" / "fixtures" / "conformance.json";
+    if (!fs::exists(fixture_path))
+    {
+        fixture_path = fs::path("tests") / "fixtures" / "conformance.json";
+    }
+    assert(fs::exists(fixture_path));
+
+    ifstream in(fixture_path, ios::binary);
+    assert(in.good());
+    string raw((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+
+    MiniJsonParser parser(raw);
+    JsonValue root = parser.parse();
+    const auto& cases = root.at("cases").as_array();
+    assert(cases.size() >= 20);
+
+    for (const JsonValue& c : cases)
+    {
+        const string& id = c.at("id").as_string();
+        assert(!id.empty());
+
+        prosze vault;
+        vault.name_level = 0;
+        vault.ephemeral = true;
+
+        for (const JsonValue& term : c.at("terms").as_array())
+        {
+            vault.add_term(term.as_string());
+        }
+        for (const JsonValue& lit : c.at("literals").as_array())
+        {
+            vault.add_literal(lit.as_string());
+        }
+
+        const string& input = c.at("input").as_string();
+        const string& expected_redacted = c.at("expected_redacted").as_string();
+        const string& expected_restored = c.at("expected_restored").as_string();
+
+        string actual_redacted = vault.redact(input);
+        if (actual_redacted != expected_redacted)
+        {
+            cerr << "Conformance mismatch (redact) in case " << id
+                 << "\n  expected: " << expected_redacted
+                 << "\n  actual:   " << actual_redacted << '\n';
+            assert(actual_redacted == expected_redacted);
+        }
+
+        string actual_restored = vault.restore(actual_redacted);
+        if (actual_restored != expected_restored)
+        {
+            cerr << "Conformance mismatch (restore) in case " << id
+                 << "\n  expected: " << expected_restored
+                 << "\n  actual:   " << actual_restored << '\n';
+            assert(actual_restored == expected_restored);
+        }
+    }
+}
+
 int main(int argc, char** argv)
 {
     if (argc >= 2 && string(argv[1]) == "--cat-helper")
@@ -742,5 +1046,6 @@ int main(int argc, char** argv)
     test_streaming_redaction_and_restoration();
     test_brand_palette_and_color_highlighting();
     test_confirm_redaction_approval_and_rejection();
+    test_cross_language_conformance_suite();
     return 0;
 }
